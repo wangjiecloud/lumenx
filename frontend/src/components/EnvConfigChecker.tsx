@@ -20,11 +20,18 @@ export default function EnvConfigChecker() {
   const checkEnvConfig = async () => {
     try {
       const config = await api.getEnvConfig();
-      // 空值和空字符串都视为未配置
+      // Backend-driven requirement: LiteLLM proxy for LLM + local models for
+      // image/video/TTS means no DashScope key is needed.
+      if (typeof config.requires_config === "boolean") {
+        if (config.requires_config) {
+          setEnvRequired(true);
+          setIsEnvDialogOpen(true);
+        }
+        return;
+      }
+      // Fallback for older backends: DashScope key required.
       const dashscopeKey = config.DASHSCOPE_API_KEY?.trim();
-      const hasRequired = dashscopeKey && dashscopeKey.length > 0;
-      
-      if (!hasRequired) {
+      if (!dashscopeKey || dashscopeKey.length === 0) {
         setEnvRequired(true);
         setIsEnvDialogOpen(true);
       }

@@ -3,15 +3,17 @@
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
 import { motion, AnimatePresence } from "framer-motion";
-import { Paintbrush, User, Users, MapPin, Box, Lock, Unlock, RefreshCw, Upload, Image as ImageIcon, X, Check, Settings, ChevronRight, Trash2, Plus, Link as LinkIcon } from "lucide-react";
+import { Paintbrush, User, Users, MapPin, Box, Lock, Unlock, RefreshCw, Upload, Image as ImageIcon, X, Check, Settings, ChevronRight, Trash2, Plus, Link as LinkIcon, Sparkles } from "lucide-react";
 import { useProjectStore } from "@/store/projectStore";
 import { api, API_URL, crudApi } from "@/lib/api";
 import { getAssetUrl } from "@/lib/utils";
+import { characterImageUrl } from "@/lib/characterImage";
 import CharacterWorkbench from "./CharacterWorkbench";
 import { VariantSelector } from "../common/VariantSelector";
 import { VideoVariantSelector } from "../common/VideoVariantSelector";
 import UploadAssetModal from "../modals/UploadAssetModal";
 import StepHeader from "@/components/shared/StepHeader";
+import StepGuide from "@/components/shared/StepGuide";
 import WorkflowActionButton from "@/components/shared/WorkflowActionButton";
 
 export default function ConsistencyVault() {
@@ -23,6 +25,8 @@ export default function ConsistencyVault() {
 
 
     const [activeTab, setActiveTab] = useState<"character" | "scene" | "prop">("character");
+    const [batchRunning, setBatchRunning] = useState(false);
+    const [batchProgress, setBatchProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
 
     // Use global state for generation status to persist across navigation
     // Refactored to track { assetId, generationType }
@@ -165,19 +169,23 @@ export default function ConsistencyVault() {
     };
 
     // Delete asset handler
-    const handleDeleteAsset = async (assetId: string, type: string) => {
+    const handleDeleteAsset = async (asset: any, type: string) => {
         if (!currentProject) return;
-        if (!confirm(`Are you sure you want to delete this ${type}?`)) return;
+        const label = type === "character" ? "角色" : type === "scene" ? "场景" : "道具";
+        if (!confirm(`确定删除「${asset?.name ?? ""}」这个${label}及其全部图片吗？该操作不可恢复。`)) return;
 
         try {
-            if (type === "character") {
-                await crudApi.deleteCharacter(currentProject.id, assetId);
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.seriesDeleteAsset(currentProject.series_id, asset.id, type);
+            } else if (type === "character") {
+                await crudApi.deleteCharacter(currentProject.id, asset.id);
             } else if (type === "scene") {
-                await crudApi.deleteScene(currentProject.id, assetId);
+                await crudApi.deleteScene(currentProject.id, asset.id);
             } else if (type === "prop") {
-                await crudApi.deleteProp(currentProject.id, assetId);
+                await crudApi.deleteProp(currentProject.id, asset.id);
             }
-            // Refresh project data
+            // Always refetch the merged project (episode + series) so the grid
+            // doesn't collapse to the empty episode-local list.
             const updatedProject = await api.getProject(currentProject.id);
             updateProject(currentProject.id, updatedProject);
         } catch (error) {
@@ -354,9 +362,103 @@ export default function ConsistencyVault() {
         setUploadTarget(null);
     };
 
+    const handleAssetRoleChange = async (asset: any, type: string, role: string) => {
+        if (!currentProject) return;
+        try {
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.updateSeriesAssetAttributes(currentProject.series_id, asset.id, type, { role });
+            } else {
+                await api.updateAssetAttributes(currentProject.id, asset.id, type, { role });
+            }
+            const updated = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, updated);
+        } catch (error) {
+            console.error("Failed to update role:", error);
+        }
+    };
+
     const assets = activeTab === "character" ? currentProject?.characters :
         activeTab === "scene" ? currentProject?.scenes :
             activeTab === "prop" ? currentProject?.props : [];
+
+    const assetHasImage = (asset: any, type: string) => {
+        if (type === "character") {
+            if ((asset?.reference_sheet?.image_variants || []).length > 0) return true;
+            return Boolean(asset?.image_url || asset?.full_body_image_url || asset?.three_view_image_url || asset?.avatar_url);
+        }
+        if ((asset?.image_asset?.image_variants || []).length > 0) return true;
+        return Boolean(asset?.image_url);
+    };
+
+    const handleToggleLock = async (asset: any, type: string) => {
+        if (!currentProject) return;
+        try {
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.toggleSeriesAssetLock(currentProject.series_id, asset.id, type);
+            } else {
+                await api.toggleAssetLock(currentProject.id, asset.id, type);
+            }
+            // Refetch merged project so the grid doesn't collapse to episode-only assets.
+            const updated = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, updated);
+        } catch (error) {
+            console.error("Failed to toggle lock:", error);
+        }
+    };
+
+    const handleGenerateAll = async () => {
+        if (!currentProject || batchRunning) return;
+        const all: { asset: any; type: "character" | "scene" | "prop" }[] = [
+            ...(currentProject.characters || []).map((a: any) => ({ asset: a, type: "character" as const })),
+            ...(currentProject.scenes || []).map((a: any) => ({ asset: a, type: "scene" as const })),
+            ...(currentProject.props || []).map((a: any) => ({ asset: a, type: "prop" as const })),
+        ];
+        const targets = all.filter(({ asset }) => !asset.locked);
+        if (targets.length === 0) {
+            alert("没有可生成的资产（可能都已锁定）。");
+            return;
+        }
+        if (!confirm(`将按顺序生成/重新生成全部 ${targets.length} 个资产（角色 + 场景 + 道具，含已生成过的，锁定项跳过），耗时很长，确定继续？`)) return;
+
+        setBatchRunning(true);
+        try {
+            for (let i = 0; i < targets.length; i++) {
+                const { asset: target, type } = targets[i];
+                setBatchProgress({ done: i, total: targets.length });
+                try {
+                    const resp = await api.generateAsset(
+                        currentProject.id,
+                        target.id,
+                        type,
+                        "ArtDirection",
+                        undefined,
+                        "all",
+                        "",
+                        true,
+                        "",
+                        1,
+                        currentProject.model_settings?.t2i_model,
+                    );
+                    const taskId = resp?._task_id;
+                    if (taskId) {
+                        for (let n = 0; n < 600; n++) {
+                            const status = await api.getTaskStatus(taskId);
+                            if (status?.status === "completed" || status?.status === "failed") break;
+                            await new Promise((r) => setTimeout(r, 3000));
+                        }
+                    }
+                } catch (err) {
+                    console.error("Batch generate failed for", type, target?.id, err);
+                }
+                const updated = await api.getProject(currentProject.id);
+                updateProject(currentProject.id, updated);
+            }
+            setBatchProgress({ done: targets.length, total: targets.length });
+        } finally {
+            setBatchRunning(false);
+            setTimeout(() => setBatchProgress({ done: 0, total: 0 }), 3000);
+        }
+    };
 
     return (
         <div className="flex flex-col h-full text-foreground">
@@ -368,6 +470,14 @@ export default function ConsistencyVault() {
                 title={tStep("vaultTitle")}
                 subtitle={tStep("vaultSubtitle")}
             />
+            <StepGuide
+                steps={[
+                    "先给角色卡片点「生成」（本地 SDXL，单张约 20–60 秒）。",
+                    "满意后点「锁定」防止重新生成；不满意可再次生成。",
+                    "按 角色 → 场景 → 道具 的顺序全部生成。",
+                    "全部完成后进入「4. 分镜」。",
+                ]}
+            />
             {/* Tab bar + sync action */}
             <div className="flex items-center justify-between gap-3 px-6 py-4 border-b border-glass-border bg-surface">
                 <div className="flex gap-2">
@@ -375,24 +485,37 @@ export default function ConsistencyVault() {
                         active={activeTab === "character"}
                         onClick={() => setActiveTab("character")}
                         icon={<User size={14} />}
-                        label="Characters"
+                        label="角色"
                         count={currentProject?.characters?.length || 0}
                     />
                     <TabButton
                         active={activeTab === "scene"}
                         onClick={() => setActiveTab("scene")}
                         icon={<MapPin size={14} />}
-                        label="Scenes"
+                        label="场景"
                         count={currentProject?.scenes?.length || 0}
                     />
                     <TabButton
                         active={activeTab === "prop"}
                         onClick={() => setActiveTab("prop")}
                         icon={<Box size={14} />}
-                        label="Props"
+                        label="道具"
                         count={currentProject?.props?.length || 0}
                     />
                 </div>
+
+                <WorkflowActionButton
+                    variant="primary"
+                    size="sm"
+                    leftIcon={batchRunning ? <RefreshCw className="animate-spin" /> : <Sparkles />}
+                    onClick={handleGenerateAll}
+                    disabled={batchRunning}
+                    title="按顺序生成当前分类下所有未生成、未锁定的资产"
+                >
+                    {batchRunning
+                        ? `一键生成中 ${batchProgress.done}/${batchProgress.total}`
+                        : "一键生成全部"}
+                </WorkflowActionButton>
 
                 <WorkflowActionButton
                     variant="secondary"
@@ -420,14 +543,14 @@ export default function ConsistencyVault() {
             <div className="flex-1 overflow-y-auto p-6">
                 {!currentProject ? (
                     <div className="flex items-center justify-center h-full text-text-muted">
-                        Loading project...
+                        正在加载项目…
                     </div>
                 ) : assets?.length === 0 ? (
                     <div className="flex flex-col items-center justify-center h-full text-text-muted gap-4">
                         <div className="w-16 h-16 rounded-full bg-glass flex items-center justify-center">
                             {activeTab === "character" ? <User size={32} /> : activeTab === "scene" ? <MapPin size={32} /> : <Box size={32} />}
                         </div>
-                        <p>No {activeTab}s found</p>
+                        <p>{activeTab === "character" ? "暂无角色" : activeTab === "scene" ? "暂无场景" : "暂无道具"}</p>
                     </div>
                 ) : (
                     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-6">
@@ -438,12 +561,13 @@ export default function ConsistencyVault() {
                                 type={activeTab}
                                 isGenerating={isAssetGenerating(asset.id)}
                                 onGenerate={() => handleGenerate(asset.id, activeTab)}
-                                onToggleLock={() => api.toggleAssetLock(currentProject.id, asset.id, activeTab).then(updated => updateProject(currentProject.id, updated))}
+                                onToggleLock={() => handleToggleLock(asset, activeTab)}
                                 onClick={() => {
                                     setSelectedAssetId(asset.id);
                                     setSelectedAssetType(activeTab);
                                 }}
-                                onDelete={() => handleDeleteAsset(asset.id, activeTab)}
+                                onDelete={() => handleDeleteAsset(asset, activeTab)}
+                                onRoleChange={(role: string) => handleAssetRoleChange(asset, activeTab, role)}
                                 onUpload={() => handleOpenUploadModal(asset, activeTab)}
                             />
                         ))}
@@ -457,7 +581,7 @@ export default function ConsistencyVault() {
                         >
                             <div className="flex flex-col items-center gap-3 text-text-secondary group-hover:text-primary transition-colors">
                                 <Plus size={40} />
-                                <span className="text-sm font-medium">Add {activeTab}</span>
+                                <span className="text-sm font-medium">{activeTab === "character" ? "添加角色" : activeTab === "scene" ? "添加场景" : "添加道具"}</span>
                             </div>
                         </motion.div>
                     </div>
@@ -550,6 +674,7 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
     // Video Controls
     const [activeTab, setActiveTab] = useState<"image" | "video">("image");
     const [videoPrompt, setVideoPrompt] = useState(asset.video_prompt || "");
+    const [role, setRole] = useState(asset.role || "配角");
 
     // Sync local state if asset changes
     useEffect(() => {
@@ -558,7 +683,24 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
         else if (!videoPrompt) {
             setVideoPrompt(`Cinematic shot of ${asset.name}, ${asset.description}, looking around, breathing, slight movement, high quality, 4k`);
         }
+        setRole(asset.role || "配角");
     }, [asset]);
+
+    const handleRoleChange = async (value: string) => {
+        setRole(value);
+        if (!currentProject) return;
+        try {
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.updateSeriesAssetAttributes(currentProject.series_id, asset.id, type, { role: value });
+            } else {
+                await api.updateAssetAttributes(currentProject.id, asset.id, type, { role: value });
+            }
+            const updated = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, updated);
+        } catch (error) {
+            console.error("Failed to update role:", error);
+        }
+    };
 
     // Sync negative prompt if style changes
     useEffect(() => {
@@ -575,7 +717,12 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
     const handleSelectVariant = async (variantId: string) => {
         if (!currentProject) return;
         try {
-            const updatedProject = await api.selectAssetVariant(currentProject.id, asset.id, type, variantId);
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.seriesSelectAssetVariant(currentProject.series_id, asset.id, type, variantId);
+            } else {
+                await api.selectAssetVariant(currentProject.id, asset.id, type, variantId);
+            }
+            const updatedProject = await api.getProject(currentProject.id);
             updateProject(currentProject.id, updatedProject);
         } catch (error) {
             console.error("Failed to select variant:", error);
@@ -584,11 +731,39 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
 
     const handleDeleteVariant = async (variantId: string) => {
         if (!currentProject) return;
+        if (!confirm("确定删除这张图片吗？该操作不可恢复。")) return;
         try {
-            const updatedProject = await api.deleteAssetVariant(currentProject.id, asset.id, type, variantId);
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.seriesDeleteAssetVariant(currentProject.series_id, asset.id, type, variantId);
+            } else {
+                await api.deleteAssetVariant(currentProject.id, asset.id, type, variantId);
+            }
+            const updatedProject = await api.getProject(currentProject.id);
             updateProject(currentProject.id, updatedProject);
         } catch (error) {
             console.error("Failed to delete variant:", error);
+        }
+    };
+
+    const handleDeleteAssetFromDetail = async () => {
+        if (!currentProject) return;
+        const label = type === "character" ? "角色" : type === "scene" ? "场景" : "道具";
+        if (!confirm(`确定删除「${asset.name}」这个${label}及其全部图片吗？该操作不可恢复。`)) return;
+        try {
+            if (asset?.source === "series" && currentProject.series_id) {
+                await api.seriesDeleteAsset(currentProject.series_id, asset.id, type);
+            } else if (type === "character") {
+                await crudApi.deleteCharacter(currentProject.id, asset.id);
+            } else if (type === "scene") {
+                await crudApi.deleteScene(currentProject.id, asset.id);
+            } else if (type === "prop") {
+                await crudApi.deleteProp(currentProject.id, asset.id);
+            }
+            onClose();
+            const updated = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, updated);
+        } catch (error) {
+            console.error("Failed to delete asset:", error);
         }
     };
 
@@ -651,10 +826,34 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
                 <div className="w-1/2 flex flex-col">
                     {/* Header */}
                     <div className="p-6 border-b border-glass-border flex justify-between items-center bg-surface">
-                        <h2 className="text-2xl font-bold text-foreground">{asset.name}</h2>
-                        <button onClick={onClose} className="p-2 hover:bg-hover-bg rounded-full text-text-secondary hover:text-foreground">
-                            <X size={24} />
-                        </button>
+                        <div className="flex items-center gap-3 flex-wrap">
+                            <h2 className="text-2xl font-bold text-foreground">{asset.name}</h2>
+                            {type === "character" && (
+                                <select
+                                    value={role}
+                                    onChange={(e) => handleRoleChange(e.target.value)}
+                                    className="bg-input-bg border border-glass-border rounded px-2 py-1 text-xs text-foreground focus:outline-none focus:border-primary"
+                                    title="角色定位（影响形象生成的美型程度）"
+                                >
+                                    <option value="主角">主角</option>
+                                    <option value="重要配角">重要配角</option>
+                                    <option value="配角">配角</option>
+                                    <option value="龙套">龙套</option>
+                                </select>
+                            )}
+                        </div>
+                        <div className="flex items-center gap-1">
+                            <button
+                                onClick={handleDeleteAssetFromDetail}
+                                title={type === "character" ? "删除该角色" : type === "scene" ? "删除该场景" : "删除该道具"}
+                                className="p-2 hover:bg-red-500/15 rounded-full text-red-400 hover:text-red-300 transition-colors"
+                            >
+                                <Trash2 size={18} />
+                            </button>
+                            <button onClick={onClose} className="p-2 hover:bg-hover-bg rounded-full text-text-secondary hover:text-foreground">
+                                <X size={24} />
+                            </button>
+                        </div>
                     </div>
 
                     {/* Content */}
@@ -662,7 +861,7 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
                         {/* Description */}
                         <div className="space-y-2">
                             <div className="flex justify-between items-center">
-                                <label className="text-sm font-bold text-text-secondary uppercase">Description</label>
+                                <label className="text-sm font-bold text-text-secondary uppercase">描述</label>
                                 {!isEditing && (
                                     <button onClick={() => setIsEditing(true)} className="text-xs text-primary hover:underline">
                                         Edit
@@ -677,8 +876,8 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
                                         className="w-full h-32 bg-input-bg border border-glass-border rounded-lg p-3 text-sm text-text-secondary resize-none focus:border-primary focus:outline-none"
                                     />
                                     <div className="flex justify-end gap-2">
-                                        <button onClick={() => { setIsEditing(false); setDescription(asset.description); }} className="px-3 py-1.5 text-xs text-text-secondary hover:text-foreground">Cancel</button>
-                                        <button onClick={handleSave} className="px-3 py-1.5 bg-primary text-white text-xs rounded hover:bg-primary/90">Save Description</button>
+                                        <button onClick={() => { setIsEditing(false); setDescription(asset.description); }} className="px-3 py-1.5 text-xs text-text-secondary hover:text-foreground">取消</button>
+                                        <button onClick={handleSave} className="px-3 py-1.5 bg-primary text-white text-xs rounded hover:bg-primary/90">保存描述</button>
                                     </div>
                                 </div>
                             ) : (
@@ -691,7 +890,7 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
                         {/* Video Prompt (Only visible in Video Tab) */}
                         {activeTab === "video" && (
                             <div className="space-y-2">
-                                <label className="text-sm font-bold text-text-secondary uppercase">Video Prompt</label>
+                                <label className="text-sm font-bold text-text-secondary uppercase">视频提示词</label>
                                 <textarea
                                     value={videoPrompt}
                                     onChange={(e) => setVideoPrompt(e.target.value)}
@@ -704,7 +903,7 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
                         {/* Style Control (Only visible in Image Tab) */}
                         {activeTab === "image" && (
                             <div className="space-y-2">
-                                <label className="text-sm font-bold text-text-secondary uppercase">Style Settings</label>
+                                <label className="text-sm font-bold text-text-secondary uppercase">风格设置</label>
                                 <div className="bg-glass rounded-lg p-3 border border-border-subtle">
                                     <div className="flex items-center gap-2 mb-2">
                                         <input
@@ -840,14 +1039,14 @@ function ImageWithRetry({ src, alt, className }: { src: string, alt: string, cla
             />
             {error && retryCount >= 10 && (
                 <div className="absolute inset-0 flex items-center justify-center bg-red-500/10 backdrop-blur-sm z-20">
-                    <span className="text-xs text-red-400 font-bold">Failed to load</span>
+                    <span className="text-xs text-red-400 font-bold">加载失败</span>
                 </div>
             )}
         </div>
     );
 }
 
-function AssetCard({ asset, type, isGenerating, onGenerate, onToggleLock, onClick, onDelete, onUpload }: any) {
+function AssetCard({ asset, type, isGenerating, onGenerate, onToggleLock, onClick, onDelete, onUpload, onRoleChange }: any) {
     const tv = useTranslations("vault");
     const isLocked = asset.locked || false;
     const currentProject = useProjectStore((state) => state.currentProject);
@@ -915,7 +1114,7 @@ function AssetCard({ asset, type, isGenerating, onGenerate, onToggleLock, onClic
                         onDelete();
                     }}
                     className="p-2 rounded-full backdrop-blur-md bg-red-500/20 text-red-400 hover:bg-red-500/40 transition-colors"
-                    title="Delete"
+                    title="删除"
                 >
                     <Trash2 size={14} />
                 </button>
@@ -935,10 +1134,36 @@ function AssetCard({ asset, type, isGenerating, onGenerate, onToggleLock, onClic
 
             {/* Bottom Info */}
             <div className="absolute bottom-0 left-0 right-0 p-4 z-30">
-                <h3 className="text-lg font-bold text-foreground mb-1 truncate">{asset.name}</h3>
+                <div className="flex items-center gap-2 mb-1 min-w-0">
+                    <h3 className="text-lg font-bold text-foreground truncate">{asset.name}</h3>
+                    {type === "character" && asset.role && (
+                        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[0.5625rem] font-medium ${
+                            asset.role === "主角" ? "bg-primary/15 text-primary" :
+                            asset.role === "重要配角" ? "bg-amber-400/15 text-amber-300" :
+                            "bg-glass text-text-muted"}`}>
+                            {asset.role}
+                        </span>
+                    )}
+                </div>
                 <p className="text-xs text-foreground/80 line-clamp-2 mb-3 h-8">
                     {asset.description || "No description"}
                 </p>
+
+                {type === "character" && (
+                    <div className="mb-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                        <span className="text-[0.625rem] text-text-muted">角色定位</span>
+                        <select
+                            value={asset.role || "配角"}
+                            onChange={(e) => onRoleChange?.(e.target.value)}
+                            className="bg-input-bg border border-glass-border rounded px-1.5 py-0.5 text-[0.6875rem] text-foreground focus:outline-none focus:border-primary"
+                        >
+                            <option value="主角">主角</option>
+                            <option value="重要配角">重要配角</option>
+                            <option value="配角">配角</option>
+                            <option value="龙套">龙套</option>
+                        </select>
+                    </div>
+                )}
 
                 <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity transform translate-y-2 group-hover:translate-y-0">
                     <WorkflowActionButton
@@ -953,7 +1178,7 @@ function AssetCard({ asset, type, isGenerating, onGenerate, onToggleLock, onClic
                         size="sm"
                         className="flex-1"
                     >
-                        {isGenerating ? "Generating..." : "Generate"}
+                        {isGenerating ? "生成中…" : "生成"}
                     </WorkflowActionButton>
                     <button
                         onClick={(e) => {
@@ -1023,7 +1248,7 @@ function CreateAssetDialog({ type, onClose, onCreate }: { type: string; onClose:
                         />
                     </div>
                     <div>
-                        <label className="block text-sm font-medium text-text-secondary mb-2">Description</label>
+                        <label className="block text-sm font-medium text-text-secondary mb-2">描述</label>
                         <textarea
                             value={description}
                             onChange={(e) => setDescription(e.target.value)}

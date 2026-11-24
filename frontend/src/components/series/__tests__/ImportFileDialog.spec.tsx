@@ -48,7 +48,7 @@ const mockPreviewResult = {
 };
 
 const mockCreatedResult = {
-    series_id: 'new-series-1',
+    series: { id: 'new-series-1', title: 'story' },
     episodes: [{ id: 'ep1' }, { id: 'ep2' }],
 };
 
@@ -270,6 +270,24 @@ describe('ImportFileDialog', () => {
 
             await waitFor(() => {
                 expect(screen.getByText(/共 2 集/)).toBeInTheDocument();
+            });
+        });
+
+        it('navigates to the created series using result.series.id', async () => {
+            mockImportFileConfirm.mockResolvedValue(mockCreatedResult);
+            await goToStep2();
+
+            fireEvent.click(screen.getByText('确认创建'));
+            await waitFor(() => {
+                expect(screen.getByText('查看系列')).toBeInTheDocument();
+            });
+
+            fireEvent.click(screen.getByText('查看系列'));
+
+            expect(window.location.hash).toBe('#/series/new-series-1');
+            expect(defaultProps.onSuccess).toHaveBeenCalledWith({
+                series_id: 'new-series-1',
+                episode_count: 2,
             });
         });
     });

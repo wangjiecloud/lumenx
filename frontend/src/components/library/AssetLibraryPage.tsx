@@ -7,6 +7,7 @@ import { api } from "@/lib/api";
 import type { Series, Project, Character, Scene, Prop, ImageAsset } from "@/store/projectStore";
 import { toast } from "@/store/toastStore";
 import { characterImageUrl, characterVariants } from "@/lib/characterImage";
+import { getAssetUrl } from "@/lib/utils";
 import { coverGradient, GRAIN_URL } from "@/lib/atelierCover";
 import { rovingKeyDown } from "@/lib/a11y";
 import AssetInspector from "./AssetInspector";
@@ -46,13 +47,22 @@ interface RenderGroup {
 
 /** 取图：character 走 characterImageUrl（reference_sheet→full_body→legacy）；scene/prop 用 image_asset。 */
 function getImageUrl(asset: Character | Scene | Prop, type: AssetTab): string | undefined {
-  if (type === "characters") return characterImageUrl(asset as Character);
-  const a = asset as Scene | Prop;
-  if (a.image_asset?.variants?.length) {
-    const sel = a.image_asset.variants.find((v) => v.id === a.image_asset?.selected_id);
-    return sel?.url || a.image_asset.variants[0]?.url;
+  let raw: string | undefined;
+  if (type === "characters") {
+    raw = characterImageUrl(asset as Character);
+  } else {
+    const a = asset as Scene | Prop;
+    if (a.image_asset?.variants?.length) {
+      const sel = a.image_asset.variants.find((v) => v.id === a.image_asset?.selected_id);
+      raw = sel?.url || a.image_asset.variants[0]?.url;
+    } else {
+      raw = a.image_url;
+    }
   }
-  return a.image_url;
+  // Stored URLs are usually relative ("uploads/x.png") and must be resolved
+  // through /files, otherwise the browser requests them from the frontend
+  // origin and they 404 (broken image icons in the library grid).
+  return raw ? getAssetUrl(raw) : undefined;
 }
 
 function variantCount(asset: Character | Scene | Prop, type: AssetTab): number {
@@ -306,7 +316,7 @@ export default function AssetLibraryPage() {
       <header className="px-4 md:px-7 pt-5 md:pt-6 pb-3 flex items-end gap-5">
         <div className="flex-1 min-w-0">
           <div className="font-mono text-[0.625rem] font-medium uppercase tracking-[0.2em] text-text-muted">
-            ASSET LIBRARY · <span className="text-primary font-semibold">{t("gallery") || "画廊"}</span>
+            资产库 · <span className="text-primary font-semibold">{t("gallery") || "画廊"}</span>
           </div>
           <h1 className="text-[1.625rem] md:text-[2.125rem] font-display atelier-display font-semibold text-foreground leading-tight tracking-tight mt-1">
             {t("title")}

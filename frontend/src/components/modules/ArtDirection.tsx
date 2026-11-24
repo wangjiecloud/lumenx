@@ -7,6 +7,7 @@ import { Sparkles, Palette, Wand2, Plus, Check, ChevronRight, Lock, RotateCcw, A
 import { useProjectStore, type StyleConfig, type StylePreset, type StylePresetCategory } from "@/store/projectStore";
 import { api } from "@/lib/api";
 import StepPageHeader, { StepPill } from "@/components/shared/StepPageHeader";
+import StepGuide from "@/components/shared/StepGuide";
 import WorkflowActionButton from "@/components/shared/WorkflowActionButton";
 import { toast } from "@/store/toastStore";
 
@@ -393,6 +394,13 @@ export default function ArtDirection() {
                 pills={projectStyle?.name ? (
                     <StepPill label={ta("styleLabel")} value={projectStyle.name} />
                 ) : null}
+            />
+            <StepGuide
+                steps={[
+                    "选择预设风格，或上传参考图 / 填写风格描述。",
+                    "调整光影、配色等风格关键词（会应用到后续所有生成）。",
+                    "点「应用」锁定风格，然后进入「3. 资产库」。",
+                ]}
             />
 
             {/* Scrollable content — full width */}

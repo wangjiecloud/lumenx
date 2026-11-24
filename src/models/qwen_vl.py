@@ -4,9 +4,15 @@ import base64
 import time
 from typing import Tuple
 
-from ..utils.endpoints import get_provider_base_url
-
 logger = logging.getLogger(__name__)
+
+_LITELLM_DEFAULT_BASE_URL = "http://10.99.99.2:9090/litellm/v1"
+_LITELLM_DEFAULT_MODEL = "deepseek-v4.1-flash"
+
+
+def _llm_provider() -> str:
+    return os.getenv("LLM_PROVIDER", "dashscope").lower()
+
 
 # System prompt template for I2V prompt optimization
 I2V_OPTIMIZATION_PROMPT = """你是一个AI视频提示词专家，我需要你帮我根据参考图和已上传的现有提示词，去优化和补充现有的让图生视频的提示词，要求：
@@ -39,14 +45,22 @@ I2V_OPTIMIZATION_PROMPT = """你是一个AI视频提示词专家，我需要你�
 
 class QwenVLModel:
     def __init__(self, config: dict):
-        self.model_name = config.get('params', {}).get('model_name', 'qwen3.7-plus')
+        if _llm_provider() == "litellm":
+            default_model = os.getenv("LITELLM_MODEL") or _LITELLM_DEFAULT_MODEL
+        else:
+            default_model = "qwen3.7-plus"
+        self.model_name = config.get("params", {}).get("model_name", default_model)
         self._client = None
 
     @property
     def api_key(self):
+        if _llm_provider() == "litellm":
+            return os.getenv("LITELLM_API_KEY") or "placeholder"
         api_key = os.getenv("DASHSCOPE_API_KEY")
         if not api_key:
-            logger.warning("Dashscope API Key not found in config or environment variables.")
+            logger.warning(
+                "Dashscope API Key not found in config or environment variables."
+            )
         return api_key
 
     def _get_client(self):
@@ -55,20 +69,37 @@ class QwenVLModel:
             try:
                 from openai import OpenAI
             except ImportError:
-                raise RuntimeError("openai package not installed. Run: pip install openai>=1.0.0")
-            self._client = OpenAI(
-                api_key=self.api_key,
-                base_url=f"{get_provider_base_url('DASHSCOPE')}/compatible-mode/v1",
-                timeout=120.0,
-            )
+                raise RuntimeError(
+                    "openai package not installed. Run: pip install openai>=1.0.0"
+                )
+            if _llm_provider() == "litellm":
+                self._client = OpenAI(
+                    api_key=self.api_key,
+                    base_url=(
+                        os.getenv("LITELLM_BASE_URL") or _LITELLM_DEFAULT_BASE_URL
+                    ).rstrip("/"),
+                    timeout=300.0,
+                    max_retries=2,
+                    default_headers={"User-Agent": "curl/8.0"},
+                )
+            else:
+                from ..utils.endpoints import get_provider_base_url
+
+                self._client = OpenAI(
+                    api_key=self.api_key,
+                    base_url=f"{get_provider_base_url('DASHSCOPE')}/compatible-mode/v1",
+                    timeout=120.0,
+                )
         return self._client
 
     def _encode_image_to_base64(self, image_path: str) -> str:
         """Convert local image to base64 string"""
         with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+            return base64.b64encode(image_file.read()).decode("utf-8")
 
-    def optimize_prompt(self, image_path: str, original_prompt: str) -> Tuple[str, float]:
+    def optimize_prompt(
+        self, image_path: str, original_prompt: str
+    ) -> Tuple[str, float]:
         """
         Optimize prompt using Qwen-VL model via OpenAI-compatible API.
 
@@ -82,7 +113,7 @@ class QwenVLModel:
         start_time = time.time()
 
         # Prepare image URL
-        if image_path.startswith('http'):
+        if image_path.startswith("http"):
             image_url = image_path
         else:
             base64_image = self._encode_image_to_base64(image_path)
@@ -96,13 +127,15 @@ class QwenVLModel:
         client = self._get_client()
         response = client.chat.completions.create(
             model=self.model_name,
-            messages=[{
-                'role': 'user',
-                'content': [
-                    {'type': 'image_url', 'image_url': {'url': image_url}},
-                    {'type': 'text', 'text': system_prompt},
-                ]
-            }]
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": system_prompt},
+                    ],
+                }
+            ],
         )
 
         optimized_prompt = response.choices[0].message.content

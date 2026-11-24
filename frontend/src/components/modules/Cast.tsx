@@ -26,6 +26,7 @@ import { api } from "@/lib/api";
 import { getAssetUrl } from "@/lib/utils";
 import { useLightbox } from "@/components/shared/preview/LightboxProvider";
 import StepPageHeader, { StepPill } from "@/components/shared/StepPageHeader";
+import StepGuide from "@/components/shared/StepGuide";
 import PreviewImage from "@/components/shared/preview/PreviewImage";
 import WorkflowActionButton from "@/components/shared/WorkflowActionButton";
 import VoicePickerModal from "./cast/VoicePickerModal";
@@ -41,6 +42,7 @@ interface CastItem {
     referenceImageUrl?: string;     // 参考图（优先 reference_sheet → full_body fallback）
     status: "ready" | "pending" | "new";
     persona?: string;               // R2V v2 P1-a — characters only; groups visual variants of same person
+    role?: string;                  // 主角 | 重要配角 | 配角 | 龙套
 }
 
 /**
@@ -135,6 +137,7 @@ export default function Cast() {
                 referenceImageUrl: imageUrl,
                 status: (imageUrl ? "ready" : "pending") as "ready" | "pending",
                 persona: c.persona ?? "",
+                role: c.role ?? "",
             };
         }).sort((a, b) => b.appearances - a.appearances || a.name.localeCompare(b.name));
 
@@ -183,6 +186,14 @@ export default function Cast() {
                         />
                     </>
                 ) : null}
+            />
+            <StepGuide
+                steps={[
+                    "顶部切换 角色 / 场景 / 道具 分类。",
+                    "卡片点「生成形象」；也可上传或迭代参考图。",
+                    "角色优先，生成满意后建议锁定。",
+                    "完成后进入「4. 分镜」。",
+                ]}
             />
 
             {/* Empty state — no entities extracted yet */}
@@ -882,9 +893,19 @@ function CastCard({ item, onOpenWorkbench }: { item: CastItem; onOpenWorkbench?:
                     )}
                 </div>
                 <div className="space-y-1 px-0.5">
-                    <p className="truncate font-sans text-[0.8125rem] font-medium text-foreground" title={item.name}>
-                        {item.name}
-                    </p>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                        <p className="truncate font-sans text-[0.8125rem] font-medium text-foreground" title={item.name}>
+                            {item.name}
+                        </p>
+                        {item.role && (
+                            <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[0.5625rem] font-medium ${
+                                item.role === "主角" ? "bg-primary/15 text-primary" :
+                                item.role === "重要配角" ? "bg-amber-400/15 text-amber-300" :
+                                "bg-glass text-text-muted"}`}>
+                                {item.role}
+                            </span>
+                        )}
+                    </div>
                     <div className="flex items-center justify-between gap-1">
                         <span className="font-mono text-[0.625rem] uppercase tracking-[0.12em] text-text-muted">
                             {t("appearancesCount", { count: item.appearances })}

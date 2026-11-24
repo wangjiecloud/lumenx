@@ -72,18 +72,23 @@ def _resolve_image_for_vision(url: str) -> Optional[str]:
       - 找不到本地文件 → 返回 None，调用方应跳过这一张
     DashScope 无法访问 localhost 或私有 OSS 路径，所以本地路径必须 inline。"""
     import base64
+
     if not url or not isinstance(url, str):
         return None
     s = url.strip()
     if not s:
         return None
-    if s.startswith("http://") or s.startswith("https://") or s.startswith("data:image/"):
+    if (
+        s.startswith("http://")
+        or s.startswith("https://")
+        or s.startswith("data:image/")
+    ):
         return s
     # 规整：'/files/foo/bar.png' → 'foo/bar.png'；'output/foo.png' 原样
     cleaned = s
     for prefix in ("/files/outputs/", "/files/output/", "/files/", "files/", "output/"):
         if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
+            cleaned = cleaned[len(prefix) :]
             break
     # 只允许解析到 output/ 目录内的文件，防止路径穿越（../../etc/passwd）
     out_base = os.path.realpath("output")
@@ -236,6 +241,25 @@ SLOTS：character1 = "White rabbit / 小兔子", character2 = "Robot dog / 机�
 }}""".strip()
 
 
+def _clean_aliases(raw) -> list:
+    """Normalize an LLM-provided aliases field into a clean list of strings."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [part.strip() for part in raw.replace("，", ",").split(",")]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    seen = set()
+    out = []
+    for item in raw:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 DEFAULT_ENTITY_EXTRACTION_PROMPT = """
 你是一名专业的分镜师与编剧。
 分析下面的小说文本，为漫画/视频制作提取结构化数据。
@@ -243,13 +267,24 @@ DEFAULT_ENTITY_EXTRACTION_PROMPT = """
 重要：
 - 所有描述性内容（名称、描述）必须使用中文（简体中文）。
 - 只提取角色（characters）、场景（scenes）和道具（props）。
+- **正名与别名**：`name` 一律填“正名/本名”。凡是文本中出现的化名、对外宣称的名字、绰号、昵称、尊称、道号、小名，全部放进 `aliases` 数组。
+  例如：韩立对外宣称叫“厉飞雨”，乡亲叫他“二愣子”，人送外号“韩老魔” →
+  name = "韩立"，aliases = ["二愣子", "厉飞雨", "韩老魔"]。
+  不要把别名写进 name 的括号里；如果无法确定正名，name 用文本中最正式的称呼，其余称呼放入 aliases。
+  场景/道具如果有别称，也放入对应 aliases。
+- **角色定位 role**：主角（贯穿全篇的核心人物，如韩立）/ 重要配角（反复出现、有名字、推动剧情）/ 配角 / 龙套（村民甲、路人等一次性角色）。
+  并按 role 设置 visual_weight：主角 5、重要配角 4、配角 3、龙套 1-2。
+- **prompt_en**：为每个角色/场景/道具额外输出一条英文图像生成提示词，保留专名音译，用通用英文服饰/器物词，不要把中文整段翻译成句子。
 
 严格按以下结构输出合法 JSON：
 {
     "characters": [
         {
             "id": "char_001",
-            "name": "角色名（如 '叶墨'、'叶墨 (古装)'）",
+            "name": "角色正名（如 '叶墨'）",
+            "aliases": ["别名/化名/昵称，如 '厉飞雨'、'二愣子'"],
+            "role": "主角 | 重要配角 | 配角 | 龙套",
+            "prompt_en": "英文图像提示词：外观/服装/发型/材质，40-80词，逗号分隔，不要解释",
             "description": "外观描述（发型、眼睛、体型、显著特征）。不要包含具体的面部表情（如 悲伤、愤怒）或临时动作（如 奔跑、哭泣）。聚焦于长期固定的外形特征。",
             "age": "年龄估计（如 '25'）",
             "gender": "性别",
@@ -260,7 +295,9 @@ DEFAULT_ENTITY_EXTRACTION_PROMPT = """
     "scenes": [
         {
             "id": "scene_001",
-            "name": "地点名（如 '咖啡店'、'古代遗迹'）",
+            "name": "地点正名（如 '咖啡店'、'古代遗迹'）",
+            "aliases": ["场景别称"],
+            "prompt_en": "场景英文图像提示词：建筑/材质/光线/氛围，40-80词",
             "description": "外观描述（光线、氛围、关键元素）",
             "visual_weight": 3
         }
@@ -269,6 +306,8 @@ DEFAULT_ENTITY_EXTRACTION_PROMPT = """
         {
             "id": "prop_001",
             "name": "道具名",
+            "aliases": ["道具别称"],
+            "prompt_en": "道具英文图像提示词：材质/形制/装饰，30-60词",
             "description": "外观描述"
         }
     ]
@@ -395,13 +434,16 @@ class ScriptProcessor:
     def __init__(self, api_key: str = None):
         self._api_key = api_key
         from .llm_adapter import LLMAdapter
+
         self.llm = LLMAdapter()
 
     @property
     def is_configured(self):
         return self.llm.is_configured
 
-    def parse_novel(self, title: str, text: str, custom_extraction_prompt: str = "") -> Script:
+    def parse_novel(
+        self, title: str, text: str, custom_extraction_prompt: str = ""
+    ) -> Script:
         """
         Parses the raw novel text into a structured Script object using an LLM.
 
@@ -410,10 +452,12 @@ class ScriptProcessor:
         use the built-in _construct_prompt template.
         """
         logger.info(f"Parsing novel: {title}...")
-        
+
         if not self.is_configured:
-             logger.error("LLM API key not configured.")
-             raise ValueError("LLM API Key 未配置。请在 API 配置中设置对应的 API Key 后重试。")
+            logger.error("LLM API key not configured.")
+            raise ValueError(
+                "LLM API Key 未配置。请在 API 配置中设置对应的 API Key 后重试。"
+            )
 
         prompt = self._construct_prompt(text, custom_extraction_prompt)
 
@@ -426,7 +470,7 @@ class ScriptProcessor:
             content = _strip_markdown_json(content)
             data = json.loads(content)
             return self._create_script_from_data(title, text, data)
-                
+
         except json.JSONDecodeError as e:
             error_msg = f"LLM 返回的数据格式错误，无法解析 JSON: {e}"
             logger.error(error_msg, exc_info=True)
@@ -439,12 +483,14 @@ class ScriptProcessor:
             logger.error(error_msg, exc_info=True)
             raise RuntimeError(error_msg)
 
-    def _create_script_from_data(self, title: str, original_text: str, data: Dict[str, Any]) -> Script:
+    def _create_script_from_data(
+        self, title: str, original_text: str, data: Dict[str, Any]
+    ) -> Script:
         script_id = str(uuid.uuid4())
-        
+
         characters = []
-        name_to_char = {} # For variant linking
-        llm_id_to_uuid = {} # For ID resolution
+        name_to_char = {}  # For variant linking
+        llm_id_to_uuid = {}  # For ID resolution
 
         # Pass 1: Create all characters
         for char_data in data.get("characters", []):
@@ -452,27 +498,32 @@ class ScriptProcessor:
             llm_id = char_data.get("id")
             if llm_id:
                 llm_id_to_uuid[llm_id] = char_uuid
-            
+
             char = Character(
                 id=char_uuid,
                 name=char_data.get("name", "Unknown"),
+                aliases=_clean_aliases(char_data.get("aliases")),
+                role=(str(char_data.get("role") or "配角").strip() or "配角"),
+                prompt_en=(char_data.get("prompt_en") or ""),
                 description=char_data.get("description", ""),
                 age=char_data.get("age"),
                 gender=char_data.get("gender"),
-                clothing=char_data.get("clothing"), # Might be merged into description in new prompt, but keeping for compatibility
+                clothing=char_data.get(
+                    "clothing"
+                ),  # Might be merged into description in new prompt, but keeping for compatibility
                 visual_weight=char_data.get("visual_weight", 3),
-                status=GenerationStatus.PENDING
+                status=GenerationStatus.PENDING,
             )
             characters.append(char)
             name_to_char[char.name] = char
-            
+
         # Pass 2: Link variants to base characters (Logic remains valid even with new prompt if naming convention holds)
         for char in characters:
             if "(" in char.name and ")" in char.name:
                 base_name = char.name.split("(")[0].strip()
                 if base_name in name_to_char and name_to_char[base_name].id != char.id:
                     char.base_character_id = name_to_char[base_name].id
-            
+
         scenes = []
         for scene_data in data.get("scenes", []):
             scene_uuid = str(uuid.uuid4())
@@ -480,16 +531,20 @@ class ScriptProcessor:
             if llm_id:
                 llm_id_to_uuid[llm_id] = scene_uuid
 
-            scenes.append(Scene(
-                id=scene_uuid,
-                name=scene_data.get("name", "Unknown"),
-                description=scene_data.get("description", ""),
-                time_of_day=scene_data.get("time_of_day"),
-                lighting_mood=scene_data.get("lighting_mood"),
-                visual_weight=scene_data.get("visual_weight", 3),
-                status=GenerationStatus.PENDING
-            ))
-            
+            scenes.append(
+                Scene(
+                    id=scene_uuid,
+                    name=scene_data.get("name", "Unknown"),
+                    aliases=_clean_aliases(scene_data.get("aliases")),
+                    prompt_en=(scene_data.get("prompt_en") or ""),
+                    description=scene_data.get("description", ""),
+                    time_of_day=scene_data.get("time_of_day"),
+                    lighting_mood=scene_data.get("lighting_mood"),
+                    visual_weight=scene_data.get("visual_weight", 3),
+                    status=GenerationStatus.PENDING,
+                )
+            )
+
         props = []
         for prop_data in data.get("props", []):
             prop_uuid = str(uuid.uuid4())
@@ -497,13 +552,17 @@ class ScriptProcessor:
             if llm_id:
                 llm_id_to_uuid[llm_id] = prop_uuid
 
-            props.append(Prop(
-                id=prop_uuid,
-                name=prop_data.get("name", "Unknown"),
-                description=prop_data.get("description", ""),
-                status=GenerationStatus.PENDING
-            ))
-            
+            props.append(
+                Prop(
+                    id=prop_uuid,
+                    name=prop_data.get("name", "Unknown"),
+                    aliases=_clean_aliases(prop_data.get("aliases")),
+                    prompt_en=(prop_data.get("prompt_en") or ""),
+                    description=prop_data.get("description", ""),
+                    status=GenerationStatus.PENDING,
+                )
+            )
+
         frames = []
         for frame_data in data.get("frames", []):
             # Resolve Character IDs
@@ -511,7 +570,7 @@ class ScriptProcessor:
             for cid in frame_data.get("character_ids", []):
                 if cid in llm_id_to_uuid:
                     char_ids.append(llm_id_to_uuid[cid])
-            
+
             # Resolve Prop IDs
             prop_ids = []
             for pid in frame_data.get("prop_ids", []):
@@ -522,9 +581,9 @@ class ScriptProcessor:
             scene_llm_id = frame_data.get("scene_id")
             scene_id = llm_id_to_uuid.get(scene_llm_id)
             if not scene_id and scenes:
-                scene_id = scenes[0].id # Fallback
+                scene_id = scenes[0].id  # Fallback
             elif not scene_id:
-                scene_id = str(uuid.uuid4()) # Fallback if no scenes
+                scene_id = str(uuid.uuid4())  # Fallback if no scenes
 
             # Handle Dialogue
             dialogue_data = frame_data.get("dialogue")
@@ -534,25 +593,27 @@ class ScriptProcessor:
                 dialogue_text = dialogue_data.get("text")
                 speaker_name = dialogue_data.get("speaker")
             elif isinstance(dialogue_data, str):
-                dialogue_text = dialogue_data # Fallback for old format
+                dialogue_text = dialogue_data  # Fallback for old format
 
-            frames.append(StoryboardFrame(
-                id=str(uuid.uuid4()),
-                scene_id=scene_id,
-                character_ids=char_ids,
-                prop_ids=prop_ids,
-                action_description=frame_data.get("action_description", ""),
-                facial_expression=frame_data.get("facial_expression"),
-                dialogue=dialogue_text,
-                speaker=speaker_name,
-                camera_angle=frame_data.get("camera_angle", "Medium Shot"),
-                camera_movement=frame_data.get("camera_movement"),
-                composition=frame_data.get("composition"),
-                atmosphere=frame_data.get("atmosphere"),
-                image_prompt=f"{frame_data.get('action_description')} {frame_data.get('facial_expression', '')} {frame_data.get('camera_angle')} {frame_data.get('lighting_mood', '')} {frame_data.get('atmosphere', '')}", 
-                status=GenerationStatus.PENDING
-            ))
-            
+            frames.append(
+                StoryboardFrame(
+                    id=str(uuid.uuid4()),
+                    scene_id=scene_id,
+                    character_ids=char_ids,
+                    prop_ids=prop_ids,
+                    action_description=frame_data.get("action_description", ""),
+                    facial_expression=frame_data.get("facial_expression"),
+                    dialogue=dialogue_text,
+                    speaker=speaker_name,
+                    camera_angle=frame_data.get("camera_angle", "Medium Shot"),
+                    camera_movement=frame_data.get("camera_movement"),
+                    composition=frame_data.get("composition"),
+                    atmosphere=frame_data.get("atmosphere"),
+                    image_prompt=f"{frame_data.get('action_description')} {frame_data.get('facial_expression', '')} {frame_data.get('camera_angle')} {frame_data.get('lighting_mood', '')} {frame_data.get('atmosphere', '')}",
+                    status=GenerationStatus.PENDING,
+                )
+            )
+
         return Script(
             id=script_id,
             title=title,
@@ -562,7 +623,7 @@ class ScriptProcessor:
             props=props,
             frames=frames,
             created_at=time.time(),
-            updated_at=time.time()
+            updated_at=time.time(),
         )
 
     def create_draft_script(self, title: str, text: str) -> Script:
@@ -578,16 +639,20 @@ class ScriptProcessor:
             props=[],
             frames=[],
             created_at=time.time(),
-            updated_at=time.time()
+            updated_at=time.time(),
         )
 
-    def split_into_episodes(self, text: str, suggested_episodes: int = 3) -> List[Dict[str, Any]]:
+    def split_into_episodes(
+        self, text: str, suggested_episodes: int = 3
+    ) -> List[Dict[str, Any]]:
         """
         Uses LLM to split a long text into episodes by narrative rhythm.
         Returns a list of episode dicts with title, summary, start/end markers, etc.
         """
         if not self.is_configured:
-            raise ValueError("LLM API Key 未配置。请在 API 配置中设置对应的 API Key 后重试。")
+            raise ValueError(
+                "LLM API Key 未配置。请在 API 配置中设置对应的 API Key 后重试。"
+            )
 
         MAX_TEXT_LENGTH = 80000
         if len(text) > MAX_TEXT_LENGTH:
@@ -641,7 +706,7 @@ class ScriptProcessor:
     def _mock_parse(self, title: str, text: str) -> Script:
         # ... (Existing mock logic moved here) ...
         script_id = str(uuid.uuid4())
-        
+
         # Mock Characters
         char1 = Character(
             id=str(uuid.uuid4()),
@@ -651,7 +716,7 @@ class ScriptProcessor:
             gender="Male",
             clothing="Leather jacket, jeans",
             visual_weight=5,
-            status=GenerationStatus.PENDING
+            status=GenerationStatus.PENDING,
         )
         char2 = Character(
             id=str(uuid.uuid4()),
@@ -661,67 +726,73 @@ class ScriptProcessor:
             gender="Female",
             clothing="Dark robe with silver embroidery",
             visual_weight=4,
-            status=GenerationStatus.PENDING
+            status=GenerationStatus.PENDING,
         )
-        
+
         # Mock Scene
         scene1 = Scene(
             id=str(uuid.uuid4()),
             name="Ancient Ruins",
             description="Crumbling stone walls covered in moss, illuminated by shafts of sunlight breaking through the canopy.",
             visual_weight=3,
-            status=GenerationStatus.PENDING
+            status=GenerationStatus.PENDING,
         )
-        
+
         # Mock Props
         prop1 = Prop(
             id=str(uuid.uuid4()),
             name="Glowing Crystal",
             description="A jagged crystal pulsing with a faint purple light.",
-            status=GenerationStatus.PENDING
+            status=GenerationStatus.PENDING,
         )
-        
+
         # Mock Frames
         frames = []
-        
+
         # Frame 1
-        frames.append(StoryboardFrame(
-            id=str(uuid.uuid4()),
-            scene_id=scene1.id,
-            character_ids=[char1.id],
-            action_description="Alex steps cautiously into the ruins, looking around.",
-            camera_angle="Wide Shot",
-            camera_movement="Pan Left",
-            image_prompt="Wide shot of Alex stepping into ancient ruins, mossy stone walls, sunlight beams, cinematic lighting, pan left.",
-            status=GenerationStatus.PENDING
-        ))
-        
+        frames.append(
+            StoryboardFrame(
+                id=str(uuid.uuid4()),
+                scene_id=scene1.id,
+                character_ids=[char1.id],
+                action_description="Alex steps cautiously into the ruins, looking around.",
+                camera_angle="Wide Shot",
+                camera_movement="Pan Left",
+                image_prompt="Wide shot of Alex stepping into ancient ruins, mossy stone walls, sunlight beams, cinematic lighting, pan left.",
+                status=GenerationStatus.PENDING,
+            )
+        )
+
         # Frame 2
-        frames.append(StoryboardFrame(
-            id=str(uuid.uuid4()),
-            scene_id=scene1.id,
-            character_ids=[char1.id, char2.id],
-            action_description="Luna appears from the shadows, surprising Alex.",
-            dialogue="Luna: You shouldn't be here.",
-            camera_angle="Medium Shot",
-            camera_movement="Static",
-            image_prompt="Medium shot of Luna emerging from shadows behind Alex, mysterious atmosphere, static camera.",
-            status=GenerationStatus.PENDING
-        ))
-        
+        frames.append(
+            StoryboardFrame(
+                id=str(uuid.uuid4()),
+                scene_id=scene1.id,
+                character_ids=[char1.id, char2.id],
+                action_description="Luna appears from the shadows, surprising Alex.",
+                dialogue="Luna: You shouldn't be here.",
+                camera_angle="Medium Shot",
+                camera_movement="Static",
+                image_prompt="Medium shot of Luna emerging from shadows behind Alex, mysterious atmosphere, static camera.",
+                status=GenerationStatus.PENDING,
+            )
+        )
+
         # Frame 3
-        frames.append(StoryboardFrame(
-            id=str(uuid.uuid4()),
-            scene_id=scene1.id,
-            character_ids=[char2.id],
-            prop_ids=[prop1.id],
-            action_description="Luna holds up the glowing crystal.",
-            camera_angle="Close Up",
-            camera_movement="Zoom In",
-            image_prompt="Close up of Luna holding a glowing purple crystal, magical effects, zoom in.",
-            status=GenerationStatus.PENDING
-        ))
-        
+        frames.append(
+            StoryboardFrame(
+                id=str(uuid.uuid4()),
+                scene_id=scene1.id,
+                character_ids=[char2.id],
+                prop_ids=[prop1.id],
+                action_description="Luna holds up the glowing crystal.",
+                camera_angle="Close Up",
+                camera_movement="Zoom In",
+                image_prompt="Close up of Luna holding a glowing purple crystal, magical effects, zoom in.",
+                status=GenerationStatus.PENDING,
+            )
+        )
+
         script = Script(
             id=script_id,
             title=title,
@@ -731,9 +802,9 @@ class ScriptProcessor:
             props=[prop1],
             frames=frames,
             created_at=time.time(),
-            updated_at=time.time()
+            updated_at=time.time(),
         )
-        
+
         return script
 
     def _construct_prompt(self, text: str, custom_prompt: str = "") -> str:
@@ -753,33 +824,37 @@ class ScriptProcessor:
             return f"{custom_prompt}\n\nText:\n{text}"
         return DEFAULT_ENTITY_EXTRACTION_PROMPT.replace("{text}", text)
 
-    def analyze_script_for_styles(self, script_text: str, custom_style_prompt: str = "") -> List[Dict[str, Any]]:
+    def analyze_script_for_styles(
+        self, script_text: str, custom_style_prompt: str = ""
+    ) -> List[Dict[str, Any]]:
         """使用 LLM 分析剧本并推荐视觉风格
 
         custom_style_prompt: optional per-project override
         (PromptConfig.style_analysis). Empty = use the built-in system prompt.
         """
-        
+
         logger.info("Analyzing script for visual style recommendations...")
-        
+
         if not self.is_configured:
-            logger.warning("DASHSCOPE_API_KEY not set. Returning default recommendations.")
+            logger.warning(
+                "DASHSCOPE_API_KEY not set. Returning default recommendations."
+            )
             return self._mock_style_recommendations()
-        
+
         if custom_style_prompt and custom_style_prompt.strip():
             system_prompt = custom_style_prompt
         else:
             system_prompt = DEFAULT_STYLE_ANALYSIS_PROMPT
 
         user_prompt = f"剧本内容：\n\n{script_text[:2000]}"  # 限制长度避免 token 限制
-        
+
         try:
             content = self.llm.chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
-                response_format={'type': 'json_object'},
+                response_format={"type": "json_object"},
             )
             logger.debug(f"Style Analysis Response:\n{content}")
 
@@ -789,12 +864,14 @@ class ScriptProcessor:
             # Safety check: if content is suspiciously long, truncate it
             # This prevents issues where the model gets stuck in a loop
             if len(content) > 5000:
-                logger.warning(f"Response too long ({len(content)} chars), truncating...")
+                logger.warning(
+                    f"Response too long ({len(content)} chars), truncating..."
+                )
                 content = content[:5000]
                 # Find the last closing brace of a recommendation object to make truncation cleaner
                 last_brace = content.rfind("}")
                 if last_brace != -1:
-                    content = content[:last_brace+1]
+                    content = content[: last_brace + 1]
 
             def repair_json(json_str):
                 """Attempt to repair truncated or malformed JSON."""
@@ -815,7 +892,7 @@ class ScriptProcessor:
 
                 # Ensure the root object is closed
                 if json_str.count("{") > json_str.count("}"):
-                     json_str += "}" * (json_str.count("{") - json_str.count("}"))
+                    json_str += "}" * (json_str.count("{") - json_str.count("}"))
 
                 return json_str
 
@@ -829,8 +906,9 @@ class ScriptProcessor:
                 try:
                     # 1. Attempt to extract JSON object from text using regex
                     import re
+
                     # Look for the outermost JSON object
-                    json_match = re.search(r'\{[\s\S]*\}', content)
+                    json_match = re.search(r"\{[\s\S]*\}", content)
                     if json_match:
                         content = json_match.group(0)
 
@@ -845,7 +923,11 @@ class ScriptProcessor:
                         logger.debug("Attempting regex extraction of fields...")
                         recommendations = []
                         # Regex to find style objects - improved to be non-greedy and handle newlines
-                        style_matches = re.finditer(r'\{\s*"name":\s*"(.*?)",\s*"description":\s*"(.*?)".*?\}', content, re.DOTALL)
+                        style_matches = re.finditer(
+                            r'\{\s*"name":\s*"(.*?)",\s*"description":\s*"(.*?)".*?\}',
+                            content,
+                            re.DOTALL,
+                        )
 
                         # If that fails, try a simpler regex that just looks for the array items
                         if not list(style_matches):
@@ -872,7 +954,7 @@ class ScriptProcessor:
 
             # Add unique IDs
             for i, rec in enumerate(recommendations):
-                rec["id"] = f"ai-rec-{i+1}-{str(uuid.uuid4())[:8]}"
+                rec["id"] = f"ai-rec-{i + 1}-{str(uuid.uuid4())[:8]}"
                 rec["is_custom"] = False
 
             return recommendations
@@ -880,7 +962,7 @@ class ScriptProcessor:
         except Exception as e:
             logger.error(f"Error analyzing script for styles: {e}", exc_info=True)
             return self._mock_style_recommendations()
-    
+
     def _mock_style_recommendations(self) -> List[Dict[str, Any]]:
         """返回默认的风格推荐"""
         return [
@@ -891,7 +973,7 @@ class ScriptProcessor:
                 "reason": "适合大多数叙事性内容，提供专业的视觉质感",
                 "positive_prompt": "cinematic, photorealistic, 8k, volumetric lighting, film grain, dramatic lighting",
                 "negative_prompt": "cartoon, anime, low quality, blurry",
-                "is_custom": False
+                "is_custom": False,
             },
             {
                 "id": f"mock-anime-{str(uuid.uuid4())[:8]}",
@@ -900,7 +982,7 @@ class ScriptProcessor:
                 "reason": "适合充满情感表现的故事",
                 "positive_prompt": "anime style, cel shading, vibrant colors, expressive, detailed character design",
                 "negative_prompt": "photorealistic, 3d, blurry, washed out",
-                "is_custom": False
+                "is_custom": False,
             },
             {
                 "id": f"mock-noir-{str(uuid.uuid4())[:8]}",
@@ -909,11 +991,37 @@ class ScriptProcessor:
                 "reason": "适合悬疑、神秘题材的叙事",
                 "positive_prompt": "black and white, film noir, high contrast, dramatic shadows, moody lighting",
                 "negative_prompt": "colorful, bright, happy, modern",
-                "is_custom": False
-            }
+                "is_custom": False,
+            },
         ]
-    
-    def analyze_to_storyboard(self, text: str, entities_json: Dict[str, Any], custom_extraction_prompt: str = "") -> List[Dict[str, Any]]:
+
+    def novel_to_screenplay(self, text: str, entities_json: Dict[str, Any]) -> str:
+        """Convert raw novel prose into the screenplay format expected by storyboard extraction."""
+        entities_str = json.dumps(entities_json, ensure_ascii=False)[:4000]
+        system = (
+            "你是一名编剧。把小说原文改写成标准分镜剧本，只输出剧本文本，不要解释。\n"
+            "格式要求：\n"
+            "- 场景标题行：`1-1 地点名 [日/夜] [内/外]`，地点名必须来自实体清单\n"
+            "- 人物行：`人物：角色名1，角色名2`，角色名必须来自实体清单\n"
+            "- 动作描述以 `△` 开头\n"
+            "- 对白：`角色名（情绪）：内容`\n"
+            "保持原文情节顺序，不新增剧情。对白必须逐字保留原文，不得改写或省略；动作事件不得遗漏。"
+        )
+        user = "实体清单：" + entities_str + "\n\n小说原文：\n" + text
+        out = self.llm.chat(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+        )
+        return (out or "").strip()
+
+    def analyze_to_storyboard(
+        self,
+        text: str,
+        entities_json: Dict[str, Any],
+        custom_extraction_prompt: str = "",
+    ) -> List[Dict[str, Any]]:
         """
         Analyzes script text and generates storyboard frames using Prompt B (Storyboard Director).
         Returns a list of frame dictionaries with visual atoms.
@@ -923,34 +1031,43 @@ class ScriptProcessor:
         contain {entities_str} and {text} placeholders, substituted before the call.
         """
         logger.info(f"Analyzing text to storyboard: {text[:100]}...")
-        
+
         if not self.is_configured:
             logger.warning("DASHSCOPE_API_KEY not set. Returning mock frames.")
             return self._mock_storyboard_frames(text)
-        
+
         # Build entities context
         characters_list = entities_json.get("characters", [])
         scenes_list = entities_json.get("scenes", [])
         props_list = entities_json.get("props", [])
 
-        entities_str = json.dumps({
-            "characters": characters_list,
-            "scenes": scenes_list,
-            "props": props_list,
-        }, ensure_ascii=False, indent=2)
+        entities_str = json.dumps(
+            {
+                "characters": characters_list,
+                "scenes": scenes_list,
+                "props": props_list,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
         template = (
             custom_extraction_prompt
             if custom_extraction_prompt and custom_extraction_prompt.strip()
             else DEFAULT_STORYBOARD_EXTRACTION_PROMPT
         )
-        system_prompt = template.replace("{entities_str}", entities_str).replace("{text}", text)
+        system_prompt = template.replace("{entities_str}", entities_str).replace(
+            "{text}", text
+        )
 
         try:
             content = self.llm.chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "请开始生成分镜帧列表，确保覆盖剧本中的所有内容。"}
+                    {
+                        "role": "user",
+                        "content": "请开始生成分镜帧列表，确保覆盖剧本中的所有内容。",
+                    },
                 ],
             ).strip()
             logger.debug(f"Storyboard Analysis Raw Response: {content[:500]}...")
@@ -960,15 +1077,22 @@ class ScriptProcessor:
                 return frames
 
             # First parse failed — retry once with response_format constraint
-            logger.warning("Storyboard JSON parse failed, retrying with response_format=json_object...")
+            logger.warning(
+                "Storyboard JSON parse failed, retrying with response_format=json_object..."
+            )
             retry_content = self.llm.chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "请开始生成分镜帧列表，确保覆盖剧本中的所有内容。请务必输出合法的JSON格式。"}
+                    {
+                        "role": "user",
+                        "content": "请开始生成分镜帧列表，确保覆盖剧本中的所有内容。请务必输出合法的JSON格式。",
+                    },
                 ],
-                response_format={'type': 'json_object'},
+                response_format={"type": "json_object"},
             ).strip()
-            logger.debug(f"Storyboard Analysis Retry Response: {retry_content[:500]}...")
+            logger.debug(
+                f"Storyboard Analysis Retry Response: {retry_content[:500]}..."
+            )
             frames = self._parse_storyboard_json(retry_content)
             if frames is not None:
                 return frames
@@ -982,7 +1106,7 @@ class ScriptProcessor:
         except Exception as e:
             logger.error(f"Error in storyboard analysis: {e}", exc_info=True)
             raise RuntimeError(f"分镜分析过程出错: {str(e)}")
-    
+
     def _parse_storyboard_json(self, content: str):
         """Try to parse storyboard JSON from LLM output. Returns frames list or None on failure."""
         content = _strip_markdown_json(content)
@@ -1013,7 +1137,7 @@ class ScriptProcessor:
                 "camera_angle": "平视",
                 "camera_movement": "Static",
                 "dialogue": None,
-                "speaker": None
+                "speaker": None,
             }
         ]
 
@@ -1114,9 +1238,12 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
             content = self.llm.chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Please refine this frame. Output valid JSON only, no markdown fences."}
+                    {
+                        "role": "user",
+                        "content": "Please refine this frame. Output valid JSON only, no markdown fences.",
+                    },
                 ],
-                response_format={'type': 'json_object'},
+                response_format={"type": "json_object"},
             ).strip()
             content = _strip_markdown_json(content)
             result = json.loads(content)
@@ -1128,7 +1255,13 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
             logger.error(f"Frame refine LLM call failed: {e}")
             return None
 
-    def polish_storyboard_prompt(self, draft_prompt: str, assets: List[Dict[str, Any]], feedback: str = "", custom_system_prompt: str = "") -> Dict[str, str]:
+    def polish_storyboard_prompt(
+        self,
+        draft_prompt: str,
+        assets: List[Dict[str, Any]],
+        feedback: str = "",
+        custom_system_prompt: str = "",
+    ) -> Dict[str, str]:
         """
         Polishes the storyboard prompt using Qwen-Plus, incorporating asset references.
         Returns a dict with 'prompt_cn' and 'prompt_en'.
@@ -1138,22 +1271,28 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
         fallback_result = {"prompt_cn": draft_prompt, "prompt_en": draft_prompt}
 
         if not self.is_configured:
-             return fallback_result
+            return fallback_result
 
         # Construct context about assets
         asset_context = []
         for i, asset in enumerate(assets):
-            asset_type = asset.get('type', 'Unknown')
-            name = asset.get('name', 'Unknown')
-            desc = asset.get('description', '')
+            asset_type = asset.get("type", "Unknown")
+            name = asset.get("name", "Unknown")
+            desc = asset.get("description", "")
             # Map index to "Image X"
-            asset_context.append(f"Image {i+1}: {asset_type} - {name} ({desc})")
+            asset_context.append(f"Image {i + 1}: {asset_type} - {name} ({desc})")
 
         context_str = "\n".join(asset_context)
 
         # Use custom prompt or default, substituting placeholders
-        template = custom_system_prompt.strip() if custom_system_prompt and custom_system_prompt.strip() else DEFAULT_STORYBOARD_POLISH_PROMPT
-        system_prompt = template.replace("{ASSETS}", context_str).replace("{DRAFT}", draft_prompt)
+        template = (
+            custom_system_prompt.strip()
+            if custom_system_prompt and custom_system_prompt.strip()
+            else DEFAULT_STORYBOARD_POLISH_PROMPT
+        )
+        system_prompt = template.replace("{ASSETS}", context_str).replace(
+            "{DRAFT}", draft_prompt
+        )
 
         # Build user message with optional feedback (injected in user content, not system prompt)
         user_content = system_prompt
@@ -1168,7 +1307,7 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
         try:
             content = self.llm.chat(
                 messages=[{"role": "user", "content": user_content}],
-                response_format={'type': 'json_object'},
+                response_format={"type": "json_object"},
             ).strip()
             logger.debug(f"Polished Prompt Raw: {content}")
 
@@ -1187,10 +1326,11 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse polish response JSON: {e}")
                 return fallback_result
-                
+
         except Exception as e:
             logger.error(f"Error polishing prompt: {e}", exc_info=True)
             return fallback_result
+
     def polish_video_prompt(
         self,
         draft_prompt: str,
@@ -1281,7 +1421,9 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
             if not parts:
                 # All image URLs failed to resolve → fall back to text-only
                 # rather than crashing. log so users can diagnose later.
-                logger.warning("polish: image_urls provided but none resolved; falling back to text-only")
+                logger.warning(
+                    "polish: image_urls provided but none resolved; falling back to text-only"
+                )
                 has_images = False
             else:
                 parts.append({"type": "text", "text": user_text})
@@ -1290,11 +1432,11 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
         try:
             content = self.llm.chat(
                 messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': user_content},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 model=polish_model or None,
-                response_format={'type': 'json_object'},
+                response_format={"type": "json_object"},
             ).strip()
         except Exception as e:
             logger.exception("Video polish: LLM API error")
@@ -1374,7 +1516,9 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
         for i, slot in enumerate(slots):
             char_id = f"character{i + 1}"
             slot_context.append(f"- {char_id}: {slot['description']}")
-        slot_context_str = "\n".join(slot_context) if slot_context else "No reference videos provided."
+        slot_context_str = (
+            "\n".join(slot_context) if slot_context else "No reference videos provided."
+        )
 
         # Use custom prompt or default, substituting {SLOTS} placeholder
         template = (
@@ -1425,7 +1569,9 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
             if not parts:
                 # All image URLs failed to resolve → fall back to text-only
                 # rather than crashing. log so users can diagnose later.
-                logger.warning("polish: image_urls provided but none resolved; falling back to text-only")
+                logger.warning(
+                    "polish: image_urls provided but none resolved; falling back to text-only"
+                )
                 has_images = False
             else:
                 parts.append({"type": "text", "text": user_text})
@@ -1434,11 +1580,11 @@ Return a JSON object with ALL fields below. null is acceptable for optional fiel
         try:
             content = self.llm.chat(
                 messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': user_content},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 model=polish_model or None,
-                response_format={'type': 'json_object'},
+                response_format={"type": "json_object"},
             ).strip()
         except Exception as e:
             logger.exception("R2V polish: LLM API error")

@@ -4,6 +4,7 @@ import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { motion } from "framer-motion";
 import { Plus, Loader2, Sparkles, PanelBottomOpen, PanelBottomClose } from "lucide-react";
 import StepPageHeader, { StepPill } from "@/components/shared/StepPageHeader";
+import StepGuide from "@/components/shared/StepGuide";
 import { useTranslations } from "next-intl";
 import { useProjectStore } from "@/store/projectStore";
 import { api, crudApi, type VideoTask, type RefineSSEEvent } from "@/lib/api";
@@ -1773,6 +1774,14 @@ export default function StoryboardR2V() {
                             inFlightCount={inFlightTaskCount}
                             open={queueOpen}
                             onToggle={() => setQueueOpen(v => !v)}
+                        />
+                        <StepGuide
+                            steps={[
+                                "点「生成分镜」把剧本拆成一个个镜头。",
+                                "逐镜检查并润色提示词（可选，走 LLM）。",
+                                "点「渲染」生成本地 SDXL 首帧；可生成多个 take 选优。",
+                                "满意后进入「5. 动效生成」。",
+                            ]}
                         />
                         <button
                             type="button"

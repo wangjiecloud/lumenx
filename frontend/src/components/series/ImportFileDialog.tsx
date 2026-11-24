@@ -21,7 +21,9 @@ interface EpisodePreview {
 
 interface PreviewResult {
     episodes: EpisodePreview[];
-    text: string;
+    text?: string;
+    import_id?: string;
+    text_length?: number;
 }
 
 type Step = 1 | 2 | 3;
@@ -136,10 +138,19 @@ export default function ImportFileDialog({ isOpen, onClose, onSuccess }: ImportF
                 title: seriesTitle.trim(),
                 description: description.trim() || undefined,
                 text: previewResult.text,
+                import_id: previewResult.import_id,
                 episodes: previewResult.episodes,
             });
+            // Backend returns { series, episodes }; older clients read
+            // result.series_id which was always undefined and navigated to
+            // #/series/undefined (empty page). Accept both shapes.
+            const seriesId: string | undefined =
+                result?.series?.id ?? result?.series_id;
+            if (!seriesId) {
+                throw new Error(t("createFailed"));
+            }
             setCreatedResult({
-                series_id: result.series_id,
+                series_id: seriesId,
                 episode_count: result.episodes?.length ?? previewResult.episodes.length,
             });
             setStep(3);

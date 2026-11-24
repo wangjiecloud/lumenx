@@ -12,6 +12,7 @@ import {
   MessageSquareCode,
   Download,
   Palette,
+  Trash2,
 } from "lucide-react";
 import clsx from "clsx";
 import type { Series, Project } from "@/store/projectStore";
@@ -49,6 +50,7 @@ interface SeriesSidebarProps {
   onOpenModelSettings: () => void;
   onOpenPromptConfig: () => void;
   onOpenImportAssets: () => void;
+  onDeleteSeries: () => void;
 }
 
 // ── Asset nav config ──
@@ -83,6 +85,7 @@ export default function SeriesSidebar({
   onOpenModelSettings,
   onOpenPromptConfig,
   onOpenImportAssets,
+  onDeleteSeries,
 }: SeriesSidebarProps) {
   const t = useTranslations("series");
   const tc = useTranslations("common");
@@ -404,6 +407,13 @@ export default function SeriesSidebar({
         >
           <Settings size={16} className="group-hover:text-foreground transition-colors" />
           <span className="text-sm">{t("genSettings")}</span>
+        </button>
+        <button
+          onClick={onDeleteSeries}
+          className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-text-secondary hover:text-red-400 hover:bg-red-500/10 transition-colors group"
+        >
+          <Trash2 size={16} className="group-hover:text-red-400 transition-colors" />
+          <span className="text-sm">{t("deleteSeries")}</span>
         </button>
       </div>
     </motion.aside>

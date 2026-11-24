@@ -257,12 +257,23 @@ export default function CharacterWorkbench({ asset, onClose, onUpdateDescription
         return task ? { isGenerating: true, batchSize: task.batchSize || 1 } : { isGenerating: false, batchSize: 1 };
     };
 
+    const isSeriesAsset = (asset as any)?.source === "series" && !!currentProject?.series_id;
+
+    const refreshMergedProject = async () => {
+        if (!currentProject) return;
+        const updated = await api.getProject(currentProject.id);
+        updateProject(currentProject.id, updated);
+    };
+
     const handleSelectVariant = async (type: "full_body" | "three_view" | "headshot", variantId: string) => {
         if (!currentProject) return;
-
         try {
-            const updatedProject = await api.selectAssetVariant(currentProject.id, asset.id, "character", variantId, type);
-            updateProject(currentProject.id, updatedProject);
+            if (isSeriesAsset) {
+                await api.seriesSelectAssetVariant(currentProject.series_id!, asset.id, "character", variantId);
+            } else {
+                await api.selectAssetVariant(currentProject.id, asset.id, "character", variantId, type);
+            }
+            await refreshMergedProject();
         } catch (error) {
             console.error("Failed to select variant:", error);
         }
@@ -270,10 +281,14 @@ export default function CharacterWorkbench({ asset, onClose, onUpdateDescription
 
     const handleDeleteVariant = async (type: "full_body" | "three_view" | "headshot", variantId: string) => {
         if (!currentProject) return;
-
+        if (!confirm("确定删除这张图片吗？该操作不可恢复。")) return;
         try {
-            const updatedProject = await api.deleteAssetVariant(currentProject.id, asset.id, "character", variantId);
-            updateProject(currentProject.id, updatedProject);
+            if (isSeriesAsset) {
+                await api.seriesDeleteAssetVariant(currentProject.series_id!, asset.id, "character", variantId);
+            } else {
+                await api.deleteAssetVariant(currentProject.id, asset.id, "character", variantId);
+            }
+            await refreshMergedProject();
         } catch (error) {
             console.error("Failed to delete variant:", error);
         }
@@ -281,10 +296,9 @@ export default function CharacterWorkbench({ asset, onClose, onUpdateDescription
 
     const handleFavoriteVariant = async (type: "full_body" | "three_view" | "headshot", variantId: string, isFavorited: boolean) => {
         if (!currentProject) return;
-
         try {
-            const updatedProject = await api.favoriteAssetVariant(currentProject.id, asset.id, "character", variantId, isFavorited, type);
-            updateProject(currentProject.id, updatedProject);
+            await api.favoriteAssetVariant(currentProject.id, asset.id, "character", variantId, isFavorited, type);
+            await refreshMergedProject();
         } catch (error) {
             console.error("Failed to favorite variant:", error);
         }

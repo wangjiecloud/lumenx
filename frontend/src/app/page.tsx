@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useId } from "react";
 import { motion } from "framer-motion";
 import {
   Plus, RefreshCw, Library, FileUp, X, ChevronDown, FileText,
-  Zap, Film, Sparkles, Search, Clock, MoreVertical,
+  Zap, Film, Sparkles, Search, Clock, MoreVertical, Trash2,
 } from "lucide-react";
 import { useProjectStore, Project } from "@/store/projectStore";
 import { toast } from "@/store/toastStore";
@@ -27,6 +27,7 @@ const ImportFileDialog = dynamic(() => import("@/components/series/ImportFileDia
 const SettingsPage = dynamic(() => import("@/components/settings/SettingsPage"), { ssr: false });
 const AssetLibraryPage = dynamic(() => import("@/components/library/AssetLibraryPage"), { ssr: false });
 const PlaygroundPage = dynamic(() => import("@/components/modules/playground/PlaygroundPage"), { ssr: false });
+const TaskManagementPage = dynamic(() => import("@/components/tasks/TaskManagementPage"), { ssr: false });
 const ScriptEditorShell = dynamic(() => import("@/components/modules/ScriptEditor/ScriptEditorShell"), { ssr: false });
 
 // ── Create Series Dialog ──
@@ -39,9 +40,11 @@ function CreateSeriesDialog({ isOpen, onClose }: { isOpen: boolean; onClose: () 
   // PR-3e — default per-shot generation mode (r2v=节奏优先 / i2v=画面优先)
   const [defaultGenerationMode, setDefaultGenerationMode] = useState<"r2v" | "i2v">("r2v");
   const [isCreating, setIsCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const t = useTranslations("workspace");
   const tc = useTranslations("common");
   const tp = useTranslations("project");
+  const ts = useTranslations("series");
 
   // a11y — dialog labelling + focus management
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -51,6 +54,7 @@ function CreateSeriesDialog({ isOpen, onClose }: { isOpen: boolean; onClose: () 
 
   useEffect(() => {
     if (!isOpen) return;
+    setError(null);
     const previouslyFocused = document.activeElement as HTMLElement | null;
     // Move focus into the dialog (the title input is the first field).
     const node = dialogRef.current;
@@ -98,6 +102,7 @@ function CreateSeriesDialog({ isOpen, onClose }: { isOpen: boolean; onClose: () 
   const handleCreate = async () => {
     if (!title.trim()) return;
     setIsCreating(true);
+    setError(null);
     try {
       // Use the v2 createSeriesV2 API directly so we can pass content_mode
       const { api } = await import("@/lib/api");
@@ -114,8 +119,13 @@ function CreateSeriesDialog({ isOpen, onClose }: { isOpen: boolean; onClose: () 
       setDefaultGenerationMode("r2v");
       onClose();
       window.location.hash = `#/series/${series.id}`;
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to create series:", error);
+      if (error?.response?.status === 409) {
+        setError(ts("seriesTitleExists"));
+      } else {
+        setError(error?.response?.data?.detail || ts("createFailed"));
+      }
     } finally {
       setIsCreating(false);
     }
@@ -290,6 +300,12 @@ function CreateSeriesDialog({ isOpen, onClose }: { isOpen: boolean; onClose: () 
           </div>
         </div>
 
+        {error && (
+          <div className="mt-4 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+            {error}
+          </div>
+        )}
+
         <div className="flex gap-3 pt-6">
           <button
             onClick={onClose}
@@ -450,7 +466,7 @@ function EpisodeBreadcrumbWrapper({ seriesId, episodeId }: { seriesId: string; e
   ];
 
   return (
-    <ProjectClient id={episodeId} breadcrumbSegments={segments} />
+    <ProjectClient id={episodeId} breadcrumbSegments={segments} seriesId={seriesId} />
   );
 }
 
@@ -462,7 +478,7 @@ export default function Home() {
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showCreateDropdown, setShowCreateDropdown] = useState(false);
-  const [currentView, setCurrentView] = useState<'home' | 'project' | 'series' | 'series-episode' | 'library' | 'settings' | 'playground' | 'studio/editor' | 'project-editor'>('home');
+  const [currentView, setCurrentView] = useState<'home' | 'project' | 'series' | 'series-episode' | 'library' | 'settings' | 'playground' | 'tasks' | 'studio/editor' | 'project-editor'>('home');
   const [activeTab, setActiveTab] = useState<GlobalTab>("workspace");
   const [wsSearch, setWsSearch] = useState("");
   const online = useOnline();
@@ -476,6 +492,7 @@ export default function Home() {
   const projects = useProjectStore((state) => state.projects);
   const seriesList = useProjectStore((state) => state.seriesList);
   const deleteProject = useProjectStore((state) => state.deleteProject);
+  const deleteSeries = useProjectStore((state) => state.deleteSeries);
   const setProjects = useProjectStore((state) => state.setProjects);
   const fetchSeriesList = useProjectStore((state) => state.fetchSeriesList);
   const t = useTranslations("workspace");
@@ -630,6 +647,14 @@ export default function Home() {
         setEpisodeId(null);
         return;
       }
+      if (hash === '#/tasks') {
+        setCurrentView('tasks');
+        setActiveTab('tasks');
+        setProjectId(null);
+        setSeriesId(null);
+        setEpisodeId(null);
+        return;
+      }
       // Menu action: open new project dialog then land on workspace
       if (hash === '#/new-project') {
         setCurrentView('home');
@@ -679,6 +704,23 @@ export default function Home() {
     setActiveTab(tab);
   };
 
+  const handleDeleteSeries = async (series: { id: string; title: string }) => {
+    if (!confirm(t("confirmDeleteSeries", { title: series.title }))) return;
+    try {
+      await deleteSeries(series.id);
+      setSeriesEpisodes((prev) => {
+        const next = { ...prev };
+        delete next[series.id];
+        return next;
+      });
+    } catch (error) {
+      console.error("Failed to delete series:", error);
+      toast.error(t("deleteSeriesFailed"), {
+        body: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   // Persisted gallery/list switch for the workspace.
   const changeViewMode = (mode: "gallery" | "list") => {
     setViewMode(mode);
@@ -695,6 +737,9 @@ export default function Home() {
     }
     if (currentView === 'playground') {
       return <PlaygroundPage />;
+    }
+    if (currentView === 'tasks') {
+      return <TaskManagementPage />;
     }
     if (currentView === 'studio/editor') {
       return <ScriptEditorShell mode="full" />;
@@ -950,6 +995,14 @@ export default function Home() {
                       <span className="font-mono text-[0.625rem] uppercase tracking-wider text-text-muted">
                         {t("series")} · {t("frames", { count: eps.length })}
                       </span>
+                      <button
+                        onClick={() => handleDeleteSeries({ id: s.id, title: s.title })}
+                        className="p-1.5 rounded-md text-text-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                        title={t("deleteSeries")}
+                        aria-label={t("deleteSeries")}
+                      >
+                        <Trash2 size={14} />
+                      </button>
                       <span className="atelier-group-line h-px flex-1 bg-glass-border" />
                     </div>
                     {viewMode === "list" ? (

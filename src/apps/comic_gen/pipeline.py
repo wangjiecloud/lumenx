@@ -8,13 +8,25 @@ import subprocess
 import threading
 import platform
 from urllib.parse import quote
-from .models import Script, GenerationStatus, VideoTask, Character, Scene, StoryboardFrame, Series, PromptConfig, ArtDirection, GlobalAssetLibrary
+from .models import (
+    Script,
+    GenerationStatus,
+    VideoTask,
+    Character,
+    Scene,
+    StoryboardFrame,
+    Series,
+    PromptConfig,
+    ArtDirection,
+    GlobalAssetLibrary,
+)
 from .llm import ScriptProcessor
 from .assets import AssetGenerator
 from .storyboard import StoryboardGenerator
 from .video import VideoGenerator
 from .audio import AudioGenerator
 from .export import ExportManager
+from .task_manager import BackgroundTaskManager, TaskStopped
 from ...utils import get_logger
 from ...utils.oss_utils import is_object_key
 from ...utils.provider_registry import resolve_provider_backend
@@ -25,7 +37,7 @@ logger = get_logger(__name__)
 # --- Security helpers ---
 
 # Allowed pattern for IDs used in file paths (UUID hex + hyphens)
-_SAFE_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
+_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 
 
 def _validate_safe_id(value: str, label: str = "id") -> str:
@@ -48,6 +60,16 @@ def _safe_resolve_path(base_dir: str, untrusted_rel: str) -> str:
     return resolved
 
 
+class DuplicateSeriesTitleError(Exception):
+    """Raised when creating/renaming a Series would collide with an existing
+    Series title (case-insensitive, whitespace-trimmed). The API maps this to
+    HTTP 409 so the client can prompt the user to pick a different name."""
+
+    def __init__(self, title: str):
+        self.title = title
+        super().__init__(f"Series title already exists: {title}")
+
+
 class LibraryAssetInUseError(Exception):
     """Raised when a global library asset cannot be hard-deleted because it is
     still referenced by one or more storyboard frames (design Q2 reference
@@ -58,7 +80,9 @@ class LibraryAssetInUseError(Exception):
          "owner_title": Optional[str], "frame_id": str}
     """
 
-    def __init__(self, asset_type: str, asset_id: str, references: List[Dict[str, Any]]):
+    def __init__(
+        self, asset_type: str, asset_id: str, references: List[Dict[str, Any]]
+    ):
         self.asset_type = asset_type
         self.asset_id = asset_id
         self.references = references
@@ -73,16 +97,18 @@ class ComicGenPipeline:
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
         self.script_processor = ScriptProcessor()
-        self.asset_generator = AssetGenerator(self.config.get('assets'))
-        self.storyboard_generator = StoryboardGenerator(self.config.get('storyboard'))
-        self.video_generator = VideoGenerator(self.config.get('video'))
-        self.audio_generator = AudioGenerator(self.config.get('audio'))
-        self.export_manager = ExportManager(self.config.get('export'))
-        
+        self.asset_generator = AssetGenerator(self.config.get("assets"))
+        self.storyboard_generator = StoryboardGenerator(self.config.get("storyboard"))
+        self.video_generator = VideoGenerator(self.config.get("video"))
+        self.audio_generator = AudioGenerator(self.config.get("audio"))
+        self.export_manager = ExportManager(self.config.get("export"))
+
         self.data_file = "output/projects.json"
         self.series_data_file = "output/series.json"
         self.library_data_file = "output/library_assets.json"
-        self._save_lock = threading.RLock()  # Reentrant lock to prevent concurrent file writes
+        self._save_lock = (
+            threading.RLock()
+        )  # Reentrant lock to prevent concurrent file writes
         self.scripts: Dict[str, Script] = self._load_data()
         self.series_store: Dict[str, Series] = self._load_series_data()
         # Project-independent global asset library (lowest resolver layer).
@@ -120,9 +146,7 @@ class ComicGenPipeline:
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("Orphan task recovery failed: %s", exc)
 
-    _ORPHAN_RECOVERY_REASON = (
-        "Backend was restarted while this task was running. Click Retry to run it again."
-    )
+    _ORPHAN_RECOVERY_REASON = "Backend was restarted while this task was running. Click Retry to run it again."
 
     def _recover_orphan_tasks(self) -> None:
         """Sweep persisted state for video tasks left in pending/processing.
@@ -243,7 +267,9 @@ class ComicGenPipeline:
             if not script:
                 return None
             frames = getattr(script, "frames", None) or []
-            frame = next((f for f in frames if getattr(f, "id", None) == frame_id), None)
+            frame = next(
+                (f for f in frames if getattr(f, "id", None) == frame_id), None
+            )
             if not frame:
                 return None
             if workbench_tab_mode is not None:
@@ -257,9 +283,11 @@ class ComicGenPipeline:
                 # Filter empties + cap FIFO so the client can't grow the
                 # list unbounded by repeated calls. The client also caps
                 # at the same limit, but defense in depth.
-                cleaned = [u for u in t2i_image_urls if isinstance(u, str) and u.strip()]
+                cleaned = [
+                    u for u in t2i_image_urls if isinstance(u, str) and u.strip()
+                ]
                 if len(cleaned) > self._T2I_HISTORY_LIMIT:
-                    cleaned = cleaned[-self._T2I_HISTORY_LIMIT:]
+                    cleaned = cleaned[-self._T2I_HISTORY_LIMIT :]
                 frame.t2i_image_urls = cleaned
             if t2i_selected_index is not None:
                 # Clamp against the resulting URL list, not whatever was
@@ -269,7 +297,9 @@ class ComicGenPipeline:
                 if not urls:
                     frame.t2i_selected_index = 0
                 else:
-                    frame.t2i_selected_index = max(0, min(int(t2i_selected_index), len(urls) - 1))
+                    frame.t2i_selected_index = max(
+                        0, min(int(t2i_selected_index), len(urls) - 1)
+                    )
             if workbench_generate_count is not None:
                 frame.workbench_generate_count = max(
                     1, min(int(workbench_generate_count), self._MAX_GENERATE_COUNT)
@@ -301,7 +331,9 @@ class ComicGenPipeline:
             if not script:
                 return None
             frames = getattr(script, "frames", None) or []
-            frame = next((f for f in frames if getattr(f, "id", None) == frame_id), None)
+            frame = next(
+                (f for f in frames if getattr(f, "id", None) == frame_id), None
+            )
             if not frame:
                 return None
             current = list(getattr(frame, "t2i_image_urls", None) or [])
@@ -309,7 +341,7 @@ class ComicGenPipeline:
             # Same FIFO cap as update_frame_workbench so uploads can't grow
             # the history unbounded either.
             if len(current) > self._T2I_HISTORY_LIMIT:
-                current = current[-self._T2I_HISTORY_LIMIT:]
+                current = current[-self._T2I_HISTORY_LIMIT :]
             frame.t2i_image_urls = current
             # Newly uploaded image becomes the active首帧 — Issue 10 design
             # requires the upload immediately unlocks Step 2.
@@ -378,18 +410,26 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         export_url = self.export_manager.render_project(script, options)
         return export_url
 
     def get_script(self, script_id: str) -> Optional[Script]:
         return self.scripts.get(script_id)
 
+    @property
+    def task_manager(self) -> BackgroundTaskManager:
+        manager = getattr(self, "_task_manager", None)
+        if manager is None:
+            manager = BackgroundTaskManager()
+            self._task_manager = manager
+        return manager
+
     def _load_data(self) -> Dict[str, Script]:
         if not os.path.exists(self.data_file):
             return {}
         try:
-            with open(self.data_file, 'r') as f:
+            with open(self.data_file, "r") as f:
                 data = json.load(f)
                 return {k: Script(**v) for k, v in data.items()}
         except Exception as e:
@@ -401,27 +441,77 @@ class ComicGenPipeline:
         with self._save_lock:
             try:
                 os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
-                with open(self.data_file, 'w') as f:
-                    json.dump({k: v.dict() for k, v in self.scripts.items()}, f, indent=2)
+                with open(self.data_file, "w") as f:
+                    json.dump(
+                        {k: v.dict() for k, v in self.scripts.items()}, f, indent=2
+                    )
             except Exception as e:
                 logger.error(f"Failed to save data: {e}")
 
     def _repair_series_bindings(self):
-        """Repair episodes listed in series.episode_ids that have series_id=None."""
-        repaired = False
+        """Reconcile Series ↔ Script references on load.
+
+        Two integrity checks run here:
+        1. An episode listed in ``series.episode_ids`` but missing from
+           ``projects.json`` is a dangling reference (historically produced by
+           an import flow that saved series before projects). Drop it so the
+           series no longer advertises episodes that resolve to "not found".
+        2. A script whose ``series_id`` points at a series that no longer
+           exists would otherwise disappear from the workspace (it is not
+           standalone and has no visible group). Clear the dangling binding.
+
+        Repairs are persisted so this is a one-time cleanup per bad record.
+        """
+        repaired_projects = False
+        repaired_series = False
+        valid_series_ids = set(self.series_store.keys())
+
         for series_id, series in self.series_store.items():
+            kept: List[str] = []
             for ep_id in series.episode_ids:
                 script = self.scripts.get(ep_id)
-                if script and not script.series_id:
+                if script is None:
+                    repaired_series = True
+                    logger.warning(
+                        f"Dropping dangling episode reference {ep_id} "
+                        f"from series {series_id}"
+                    )
+                    continue
+                kept.append(ep_id)
+                if not script.series_id:
                     script.series_id = series_id
                     if not script.episode_number:
                         script.episode_number = series.episode_ids.index(ep_id) + 1
-                    repaired = True
-                    logger.info(f"Repaired series binding: episode {ep_id} → series {series_id}")
-        if repaired:
-            self._save_data()
+                    repaired_projects = True
+                    logger.info(
+                        f"Repaired series binding: episode {ep_id} → series {series_id}"
+                    )
+            if len(kept) != len(series.episode_ids):
+                series.episode_ids = kept
 
-    def create_project(self, title: str, text: str, skip_analysis: bool = False, workflow_mode: str = "i2v_legacy", series_id: Optional[str] = None) -> Script:
+        for script in self.scripts.values():
+            if script.series_id and script.series_id not in valid_series_ids:
+                logger.warning(
+                    f"Clearing dangling series binding on project {script.id} "
+                    f"(series {script.series_id} missing)"
+                )
+                script.series_id = None
+                script.episode_number = None
+                repaired_projects = True
+
+        if repaired_projects:
+            self._save_data()
+        if repaired_series:
+            self._save_series_data()
+
+    def create_project(
+        self,
+        title: str,
+        text: str,
+        skip_analysis: bool = False,
+        workflow_mode: str = "i2v_legacy",
+        series_id: Optional[str] = None,
+    ) -> Script:
         """Step 1: Parse novel and create project.
 
         When `series_id` is provided the new project is bound as the next
@@ -450,22 +540,34 @@ class ComicGenPipeline:
             if not series:
                 raise ValueError("Series not found")
             existing = self.get_series_episodes(series_id)
-            max_ep = max([ep.episode_number for ep in existing if ep.episode_number] or [0])
+            max_ep = max(
+                [ep.episode_number for ep in existing if ep.episode_number] or [0]
+            )
             self.add_episode_to_series(series_id, script.id, episode_number=max_ep + 1)
         return script
-    
+
     def extract_preview(self, script_id: str, text: str) -> Script:
         """Run entity extraction without saving. Cache result for subsequent apply."""
         existing_script = self.scripts.get(script_id)
         if not existing_script:
             raise ValueError("Script not found")
-        custom_extraction = getattr(getattr(existing_script, "prompt_config", None), "entity_extraction", "")
-        new_script = self.script_processor.parse_novel(existing_script.title, text, custom_extraction)
+        custom_extraction = getattr(
+            getattr(existing_script, "prompt_config", None), "entity_extraction", ""
+        )
+        new_script = self.script_processor.parse_novel(
+            existing_script.title, text, custom_extraction
+        )
         self._extraction_cache[script_id] = (time.time(), new_script)
         return new_script
 
-    def reparse_project(self, script_id: str, text: str) -> Script:
-        """Re-parse the text for an existing project, replacing all entities."""
+    def reparse_project(
+        self, script_id: str, text: str, preserve_frames: bool = False
+    ) -> Script:
+        """Re-parse the text for an existing project, replacing all entities.
+
+        When preserve_frames=True, existing storyboard frames are carried over
+        and their entity references are remapped to the freshly parsed ids
+        (default False — frames are rebuilt from scratch)."""
         existing_script = self.scripts.get(script_id)
         if not existing_script:
             raise ValueError("Script not found")
@@ -475,14 +577,18 @@ class ComicGenPipeline:
         if cached and (time.time() - cached[0]) < 300:
             new_script = cached[1]
         else:
-            custom_extraction = getattr(getattr(existing_script, "prompt_config", None), "entity_extraction", "")
-            new_script = self.script_processor.parse_novel(existing_script.title, text, custom_extraction)
-        
+            custom_extraction = getattr(
+                getattr(existing_script, "prompt_config", None), "entity_extraction", ""
+            )
+            new_script = self.script_processor.parse_novel(
+                existing_script.title, text, custom_extraction
+            )
+
         # Preserve the original script ID and timestamps
         new_script.id = existing_script.id
         new_script.created_at = existing_script.created_at
         new_script.updated_at = time.time()
-        
+
         # Preserve project-level settings
         new_script.art_direction = existing_script.art_direction
         new_script.model_settings = existing_script.model_settings
@@ -503,49 +609,203 @@ class ComicGenPipeline:
         new_script.default_generation_mode = existing_script.default_generation_mode
         new_script.bgm_url = existing_script.bgm_url
         new_script.mix_settings = existing_script.mix_settings
-        
+
+        # Preserve already-generated media: match entities by name + aliases and
+        # carry over images/videos/lock/voice state. Only text-derived fields
+        # (name/description/…) come from the fresh parse.
+        id_map = self._merge_entity_assets(existing_script, new_script)
+
+        if preserve_frames and existing_script.frames:
+            from copy import deepcopy
+
+            remapped = []
+            for frame in existing_script.frames:
+                cloned = deepcopy(frame)
+                cloned.scene_id = id_map.get(cloned.scene_id, cloned.scene_id)
+                cloned.character_ids = [
+                    id_map.get(cid, cid) for cid in cloned.character_ids
+                ]
+                cloned.prop_ids = [id_map.get(pid, pid) for pid in cloned.prop_ids]
+                remapped.append(cloned)
+            new_script.frames = remapped
+            logger.info("Preserved %d storyboard frames across reparse", len(remapped))
+
         # Replace the script in memory
         self.scripts[script_id] = new_script
         self._save_data()
         return new_script
 
+    _CHAR_ASSET_FIELDS = (
+        "reference_sheet",
+        "full_body",
+        "three_views",
+        "head_shot",
+        "full_body_image_url",
+        "full_body_prompt",
+        "full_body_asset",
+        "three_view_image_url",
+        "three_view_prompt",
+        "three_view_asset",
+        "headshot_image_url",
+        "headshot_prompt",
+        "headshot_asset",
+        "video_assets",
+        "video_prompt",
+        "image_url",
+        "avatar_url",
+        "is_consistent",
+        "full_body_updated_at",
+        "three_view_updated_at",
+        "headshot_updated_at",
+        "persona",
+        "voice_id",
+        "voice_name",
+        "voice_speed",
+        "voice_pitch",
+        "voice_volume",
+        "voice_origin",
+        "locked",
+        "starred",
+        "status",
+    )
+    _SCENE_ASSET_FIELDS = (
+        "image_url",
+        "image_asset",
+        "video_assets",
+        "video_prompt",
+        "locked",
+        "starred",
+        "status",
+    )
+    _PROP_ASSET_FIELDS = (
+        "video_url",
+        "audio_url",
+        "sfx_url",
+        "bgm_url",
+        "image_url",
+        "image_asset",
+        "video_assets",
+        "video_prompt",
+        "locked",
+        "starred",
+        "status",
+    )
+
+    @staticmethod
+    def _entity_keys(entity) -> set:
+        import re as _re
+
+        keys = set()
+        name = (getattr(entity, "name", "") or "").strip().lower()
+        if name:
+            keys.add(name)
+            base = _re.split(r"[（(]", name)[0].strip()
+            if base:
+                keys.add(base)
+        for alias in getattr(entity, "aliases", None) or []:
+            alias = (alias or "").strip().lower()
+            if alias:
+                keys.add(alias)
+        return keys
+
+    def _merge_entity_assets(self, old_script, new_script) -> dict:
+        """Carry generated media across a reparse by name/alias matching.
+        Returns {old_entity_id: new_entity_id} for reference remapping."""
+        groups = (
+            (old_script.characters, new_script.characters, self._CHAR_ASSET_FIELDS),
+            (old_script.scenes, new_script.scenes, self._SCENE_ASSET_FIELDS),
+            (old_script.props, new_script.props, self._PROP_ASSET_FIELDS),
+        )
+        char_matches = {}
+        id_map = {}
+        for old_pool, new_pool, fields in groups:
+            used = set()
+            for new_entity in new_pool:
+                new_keys = self._entity_keys(new_entity)
+                match = None
+                for old_entity in old_pool:
+                    if old_entity.id in used:
+                        continue
+                    if new_keys & self._entity_keys(old_entity):
+                        match = old_entity
+                        break
+                if match is None:
+                    continue
+                used.add(match.id)
+                char_matches[new_entity.id] = match
+                id_map[match.id] = new_entity.id
+                for field in fields:
+                    if hasattr(match, field) and hasattr(new_entity, field):
+                        try:
+                            setattr(new_entity, field, getattr(match, field))
+                        except Exception:
+                            logger.warning("Failed to carry over asset field %s", field)
+
+        # Remap variant links (base_character_id) old-id → new-id.
+        new_ids = {getattr(old, "id"): new_id for new_id, old in char_matches.items()}
+        for new_entity in new_script.characters:
+            old = char_matches.get(new_entity.id)
+            if old is None:
+                continue
+            old_base = getattr(old, "base_character_id", None)
+            if old_base and not new_entity.base_character_id:
+                new_entity.base_character_id = new_ids.get(old_base)
+        return id_map
 
     def generate_assets(self, script_id: str) -> Script:
         """Step 2: Generate character and scene assets (Batch)."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         logger.info(f"Generating assets for script {script.id}")
-        
+
         # Sort characters: Base characters first (those without base_character_id)
-        sorted_chars = sorted(script.characters, key=lambda c: 0 if not c.base_character_id else 1)
+        sorted_chars = sorted(
+            script.characters, key=lambda c: 0 if not c.base_character_id else 1
+        )
 
         for char in sorted_chars:
             self.generate_asset(script_id, char.id, "character")
-            
+
         for scene in script.scenes:
             self.generate_asset(script_id, scene.id, "scene")
-            
+
         for prop in script.props:
             self.generate_asset(script_id, prop.id, "prop")
-            
+
         self._save_data()
         return script
 
-    def generate_asset(self, script_id: str, asset_id: str, asset_type: str, style_preset: str = None, reference_image_url: str = None, style_prompt: str = None, generation_type: str = "all", prompt: str = None, apply_style: bool = True, negative_prompt: str = None, batch_size: int = 1, model_name: str = None, aspect_ratio: str = None) -> Script:
+    def generate_asset(
+        self,
+        script_id: str,
+        asset_id: str,
+        asset_type: str,
+        style_preset: str = None,
+        reference_image_url: str = None,
+        style_prompt: str = None,
+        generation_type: str = "all",
+        prompt: str = None,
+        apply_style: bool = True,
+        negative_prompt: str = None,
+        batch_size: int = 1,
+        model_name: str = None,
+        aspect_ratio: str = None,
+    ) -> Script:
         """Step 2: Generate a specific asset (character/scene/prop).
         If style_preset is None, uses the project's global style."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         # Get effective model names from project settings if not overridden
         t2i_model = model_name or script.model_settings.t2i_model
         i2i_model = script.model_settings.i2i_model
-        
+
         # Get effective size based on asset type (aspect_ratio param overrides model_settings)
         from .assets import ASPECT_RATIO_TO_SIZE
+
         if aspect_ratio:
             effective_aspect = aspect_ratio
         elif asset_type == "character":
@@ -565,7 +825,7 @@ class ComicGenPipeline:
             default_size = "1024*1024"
 
         effective_size = ASPECT_RATIO_TO_SIZE.get(effective_aspect, default_size)
-        
+
         # Determine effective style: Art Direction > passed style > legacy style
         effective_positive_prompt = ""
         effective_negative_prompt = negative_prompt or ""
@@ -581,10 +841,18 @@ class ComicGenPipeline:
 
         if apply_style:
             if resolved_art_direction and resolved_art_direction.style_config:
-                effective_positive_prompt = resolved_art_direction.style_config.get('positive_prompt', '')
-                global_neg = resolved_art_direction.style_config.get('negative_prompt', '')
+                effective_positive_prompt = resolved_art_direction.style_config.get(
+                    "positive_prompt", ""
+                )
+                global_neg = resolved_art_direction.style_config.get(
+                    "negative_prompt", ""
+                )
                 if global_neg:
-                    effective_negative_prompt = f"{effective_negative_prompt}, {global_neg}" if effective_negative_prompt else global_neg
+                    effective_negative_prompt = (
+                        f"{effective_negative_prompt}, {global_neg}"
+                        if effective_negative_prompt
+                        else global_neg
+                    )
             elif style_prompt:
                 effective_positive_prompt = style_prompt
             elif style_preset:
@@ -593,7 +861,7 @@ class ComicGenPipeline:
                 effective_positive_prompt = f"{script.style_preset} style"
                 if script.style_prompt:
                     effective_positive_prompt += f", {script.style_prompt}"
-        
+
         asset_list = []
         target_asset = None
 
@@ -616,8 +884,10 @@ class ComicGenPipeline:
             series = self.series_store.get(script.series_id)
             if series:
                 series_list = (
-                    series.characters if asset_type == "character"
-                    else series.scenes if asset_type == "scene"
+                    series.characters
+                    if asset_type == "character"
+                    else series.scenes
+                    if asset_type == "scene"
                     else series.props
                 )
                 target_asset = next((a for a in series_list if a.id == asset_id), None)
@@ -630,12 +900,12 @@ class ComicGenPipeline:
         self._save_data()
         if asset_is_series_level:
             self._save_series_data()
-        
+
         try:
             # Generate with Art Direction style injected
             if asset_type == "character":
                 # Pass generation_type and specific prompt if available
-                # If prompt is provided (from Workbench), use it directly. 
+                # If prompt is provided (from Workbench), use it directly.
                 # Otherwise, asset_generator will construct it using effective_positive_prompt.
                 # Note: If prompt is provided, we might still want to append style if it's not included?
                 # For now, let's assume the Workbench passes the FULL prompt or we pass style separately.
@@ -643,21 +913,35 @@ class ComicGenPipeline:
                 # If 'prompt' is None, it constructs one.
                 # We should pass effective_positive_prompt as 'positive_prompt' (style suffix) to be appended if needed.
                 self.asset_generator.generate_character(
-                    target_asset, 
-                    generation_type=generation_type, 
-                    prompt=prompt, 
-                    positive_prompt=effective_positive_prompt, # Used as style suffix if prompt is auto-generated
+                    target_asset,
+                    generation_type=generation_type,
+                    prompt=prompt,
+                    positive_prompt=effective_positive_prompt,  # Used as style suffix if prompt is auto-generated
                     negative_prompt=effective_negative_prompt,
                     batch_size=batch_size,
                     model_name=t2i_model,
                     i2i_model_name=i2i_model,
-                    size=effective_size
+                    size=effective_size,
                 )
             elif asset_type == "scene":
-                self.asset_generator.generate_scene(target_asset, effective_positive_prompt, effective_negative_prompt, batch_size=batch_size, model_name=t2i_model, size=effective_size)
+                self.asset_generator.generate_scene(
+                    target_asset,
+                    effective_positive_prompt,
+                    effective_negative_prompt,
+                    batch_size=batch_size,
+                    model_name=t2i_model,
+                    size=effective_size,
+                )
             elif asset_type == "prop":
-                self.asset_generator.generate_prop(target_asset, effective_positive_prompt, effective_negative_prompt, batch_size=batch_size, model_name=t2i_model, size=effective_size)
-                
+                self.asset_generator.generate_prop(
+                    target_asset,
+                    effective_positive_prompt,
+                    effective_negative_prompt,
+                    batch_size=batch_size,
+                    model_name=t2i_model,
+                    size=effective_size,
+                )
+
             target_asset.status = GenerationStatus.COMPLETED
         except Exception as e:
             target_asset.status = GenerationStatus.FAILED
@@ -673,17 +957,27 @@ class ComicGenPipeline:
 
         return script
 
-    def create_asset_generation_task(self, script_id: str, asset_id: str, asset_type: str,
-                                      style_preset: str = None, reference_image_url: str = None,
-                                      style_prompt: str = None, generation_type: str = "all",
-                                      prompt: str = None, apply_style: bool = True,
-                                      negative_prompt: str = None, batch_size: int = 1,
-                                      model_name: str = None, aspect_ratio: str = None) -> Tuple[Script, str]:
+    def create_asset_generation_task(
+        self,
+        script_id: str,
+        asset_id: str,
+        asset_type: str,
+        style_preset: str = None,
+        reference_image_url: str = None,
+        style_prompt: str = None,
+        generation_type: str = "all",
+        prompt: str = None,
+        apply_style: bool = True,
+        negative_prompt: str = None,
+        batch_size: int = 1,
+        model_name: str = None,
+        aspect_ratio: str = None,
+    ) -> Tuple[Script, str]:
         """Creates an async asset generation task and returns (script, task_id) immediately."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         # Find the asset and set to PROCESSING
         asset_list = []
         if asset_type == "character":
@@ -703,8 +997,10 @@ class ComicGenPipeline:
             series = self.series_store.get(script.series_id)
             if series:
                 series_list = (
-                    series.characters if asset_type == "character"
-                    else series.scenes if asset_type == "scene"
+                    series.characters
+                    if asset_type == "character"
+                    else series.scenes
+                    if asset_type == "scene"
                     else series.props
                 )
                 target_asset = next((a for a in series_list if a.id == asset_id), None)
@@ -716,7 +1012,7 @@ class ComicGenPipeline:
         target_asset.status = GenerationStatus.PROCESSING
         if asset_is_series_level:
             self._save_series_data()
-        
+
         # Create task
         task_id = str(uuid.uuid4())
         self.asset_generation_tasks[task_id] = {
@@ -739,9 +1035,9 @@ class ComicGenPipeline:
                 "batch_size": batch_size,
                 "model_name": model_name,
                 "aspect_ratio": aspect_ratio,
-            }
+            },
         }
-        
+
         self._save_data()
         return script, task_id
 
@@ -752,9 +1048,35 @@ class ComicGenPipeline:
             logger.error(f"Task {task_id} not found")
             return
 
+        asset_type = task.get("asset_type", "asset")
+        title = f"资产生成 · {asset_type}"
+        series_id = None
+        project_id = None
+        if task.get("is_series"):
+            series = self.series_store.get(task.get("script_id"))
+            series_id = task.get("script_id")
+            if series:
+                title = f"系列资产生成 · {series.title} · {asset_type}"
+        else:
+            project_id = task.get("script_id")
+            script = self.scripts.get(project_id)
+            if script:
+                title = f"资产生成 · {script.title} · {asset_type}"
+
+        self.task_manager.register(
+            task_id,
+            kind="asset_generation",
+            title=title,
+            project_id=None if task.get("is_series") else project_id,
+            series_id=series_id,
+            asset_id=task.get("asset_id"),
+            asset_type=asset_type,
+        )
+
         task["status"] = "processing"
 
         try:
+            self.task_manager.checkpoint(task_id)
             params = task["params"]
             if task.get("is_series"):
                 # Series asset generation — operate on series_store
@@ -776,12 +1098,20 @@ class ComicGenPipeline:
                     params["model_name"],
                     params.get("aspect_ratio"),
                 )
+            self.task_manager.checkpoint(task_id)
             task["status"] = "completed"
             task["progress"] = 100
+            self.task_manager.finish(task_id, "completed")
             logger.info(f"Task {task_id} completed successfully")
+        except TaskStopped:
+            task["status"] = "canceled"
+            task["error"] = "Canceled by user"
+            self.task_manager.finish(task_id, "canceled", error="Canceled by user")
+            logger.info(f"Task {task_id} canceled by user")
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+            self.task_manager.finish(task_id, "failed", error=str(e))
             logger.error(f"Task {task_id} failed: {e}")
 
     def _process_series_asset_task(self, task: Dict, params: Dict):
@@ -807,42 +1137,57 @@ class ComicGenPipeline:
             if not target:
                 raise ValueError(f"Character {asset_id} not found in series")
             self.asset_generator.generate_character(
-                target, generation_type=generation_type, prompt=prompt or "",
-                positive_prompt=positive_prompt, negative_prompt=negative_prompt,
-                batch_size=batch_size, model_name=t2i_model, size=effective_size,
+                target,
+                generation_type=generation_type,
+                prompt=prompt or "",
+                positive_prompt=positive_prompt,
+                negative_prompt=negative_prompt,
+                batch_size=batch_size,
+                model_name=t2i_model,
+                size=effective_size,
             )
         elif asset_type == "scene":
             target = next((s for s in series.scenes if s.id == asset_id), None)
             if not target:
                 raise ValueError(f"Scene {asset_id} not found in series")
             self.asset_generator.generate_scene(
-                target, positive_prompt=positive_prompt, negative_prompt=negative_prompt,
-                batch_size=batch_size, model_name=t2i_model, size=effective_size,
+                target,
+                positive_prompt=positive_prompt,
+                negative_prompt=negative_prompt,
+                batch_size=batch_size,
+                model_name=t2i_model,
+                size=effective_size,
             )
         elif asset_type == "prop":
             target = next((p for p in series.props if p.id == asset_id), None)
             if not target:
                 raise ValueError(f"Prop {asset_id} not found in series")
             self.asset_generator.generate_prop(
-                target, positive_prompt=positive_prompt, negative_prompt=negative_prompt,
-                batch_size=batch_size, model_name=t2i_model, size=effective_size,
+                target,
+                positive_prompt=positive_prompt,
+                negative_prompt=negative_prompt,
+                batch_size=batch_size,
+                model_name=t2i_model,
+                size=effective_size,
             )
         else:
             raise ValueError(f"Unknown asset type: {asset_type}")
 
         self._save_series_data()
 
-    def get_asset_generation_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+    def get_asset_generation_task_status(
+        self, task_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Returns the status of an asset generation task."""
         # Check image tasks first
         task = self.asset_generation_tasks.get(task_id)
         if not task:
             # Then check video tasks
             task = self.video_generation_tasks.get(task_id)
-            
+
         if not task:
             return None
-        
+
         return {
             "task_id": task_id,
             "status": task["status"],
@@ -851,17 +1196,24 @@ class ComicGenPipeline:
             "asset_id": task.get("asset_id"),
             "asset_type": task.get("asset_type"),
             "script_id": task.get("script_id"),
-            "created_at": task.get("created_at")
+            "created_at": task.get("created_at"),
         }
 
-    def create_motion_ref_task(self, script_id: str, asset_id: str, asset_type: str, 
-                                prompt: Optional[str] = None, audio_url: Optional[str] = None, 
-                                duration: int = 5, batch_size: int = 1) -> Tuple[Script, str]:
+    def create_motion_ref_task(
+        self,
+        script_id: str,
+        asset_id: str,
+        asset_type: str,
+        prompt: Optional[str] = None,
+        audio_url: Optional[str] = None,
+        duration: int = 5,
+        batch_size: int = 1,
+    ) -> Tuple[Script, str]:
         """Creates an async motion reference generation task."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         task_id = str(uuid.uuid4())
         self.video_generation_tasks[task_id] = {
             "status": "pending",
@@ -875,10 +1227,10 @@ class ComicGenPipeline:
                 "prompt": prompt,
                 "audio_url": audio_url,
                 "duration": duration,
-                "batch_size": batch_size
-            }
+                "batch_size": batch_size,
+            },
         }
-        
+
         self._save_data()
         return script, task_id
 
@@ -888,10 +1240,26 @@ class ComicGenPipeline:
         if not task:
             logger.error(f"Video task {task_id} not found")
             return
-            
+
         task["status"] = "processing"
-        
+
+        script = self.scripts.get(script_id)
+        title = (
+            f"动效参考生成 · {script.title} · {task.get('asset_type', 'asset')}"
+            if script
+            else f"动效参考生成 · {task.get('asset_type', 'asset')}"
+        )
+        self.task_manager.register(
+            task_id,
+            kind="motion_ref",
+            title=title,
+            project_id=script_id,
+            asset_id=task.get("asset_id"),
+            asset_type=task.get("asset_type"),
+        )
+
         try:
+            self.task_manager.checkpoint(task_id)
             params = task["params"]
             # Call the synchronous generate_motion_ref method
             self.generate_motion_ref(
@@ -901,56 +1269,64 @@ class ComicGenPipeline:
                 prompt=params["prompt"],
                 audio_url=params["audio_url"],
                 duration=params["duration"],
-                batch_size=params["batch_size"]
+                batch_size=params["batch_size"],
             )
+            self.task_manager.checkpoint(task_id)
             task["status"] = "completed"
             task["progress"] = 100
+            self.task_manager.finish(task_id, "completed")
             logger.info(f"Video task {task_id} completed successfully")
+        except TaskStopped:
+            task["status"] = "canceled"
+            task["error"] = "Canceled by user"
+            self.task_manager.finish(task_id, "canceled", error="Canceled by user")
+            logger.info(f"Video task {task_id} canceled by user")
         except Exception as e:
             task["status"] = "failed"
             task["error"] = str(e)
+            self.task_manager.finish(task_id, "failed", error=str(e))
             logger.error(f"Video task {task_id} failed: {e}")
 
     def sync_descriptions_from_script_entities(self, script_id: str) -> Script:
         """
         Syncs entity descriptions from ScriptProcessor parsed entities.
         This clears saved prompts so the UI will regenerate them from the current description.
-        
+
         Note: This only updates prompts, not generated images/videos.
         """
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         # Clear saved prompts for all characters so UI will regenerate from description
         for character in script.characters:
             character.full_body_prompt = None
             character.three_view_prompt = None
             character.headshot_prompt = None
             character.video_prompt = None
-        
+
         # Scenes and props might also have prompts to clear (if applicable)
         for scene in script.scenes:
-            if hasattr(scene, 'prompt'):
+            if hasattr(scene, "prompt"):
                 scene.prompt = None
-        
+
         for prop in script.props:
-            if hasattr(prop, 'prompt'):
+            if hasattr(prop, "prompt"):
                 prop.prompt = None
-        
+
         self._save_data()
-        logger.info(f"Descriptions synced for script {script_id}: cleared prompts for {len(script.characters)} characters, {len(script.scenes)} scenes, {len(script.props)} props")
+        logger.info(
+            f"Descriptions synced for script {script_id}: cleared prompts for {len(script.characters)} characters, {len(script.scenes)} scenes, {len(script.props)} props"
+        )
         return script
 
     def add_character(self, script_id: str, name: str, description: str) -> Script:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         new_char = Character(
-            id=f"char_{uuid.uuid4().hex[:8]}",
-            name=name,
-            description=description
+            id=f"char_{uuid.uuid4().hex[:8]}", name=name, description=description
         )
         script.characters.append(new_char)
         self._save_data()
@@ -960,7 +1336,7 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         script.characters = [c for c in script.characters if c.id != char_id]
         self._save_data()
         return script
@@ -969,11 +1345,9 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         new_scene = Scene(
-            id=f"scene_{uuid.uuid4().hex[:8]}",
-            name=name,
-            description=description
+            id=f"scene_{uuid.uuid4().hex[:8]}", name=name, description=description
         )
         script.scenes.append(new_scene)
         self._save_data()
@@ -983,11 +1357,11 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         script.scenes = [s for s in script.scenes if s.id != scene_id]
         self._save_data()
         return script
-    
+
     def _find_asset_with_source(
         self, script: "Script", asset_id: str, asset_type: str
     ) -> Tuple[Optional[object], Optional[str]]:
@@ -1052,7 +1426,9 @@ class ComicGenPipeline:
         else:
             self._save_data()
 
-    def toggle_asset_lock(self, script_id: str, asset_id: str, asset_type: str) -> Script:
+    def toggle_asset_lock(
+        self, script_id: str, asset_id: str, asset_type: str
+    ) -> Script:
         """Toggle the locked status of an asset. Works on both
         episode-local and series-shared assets (A2 decision: default
         write to series, since locking a shared character should
@@ -1061,7 +1437,9 @@ class ComicGenPipeline:
         if not script:
             raise ValueError("Script not found")
 
-        target_asset, source = self._find_asset_with_source(script, asset_id, asset_type)
+        target_asset, source = self._find_asset_with_source(
+            script, asset_id, asset_type
+        )
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
 
@@ -1070,7 +1448,9 @@ class ComicGenPipeline:
         self._save_after_asset_mutation(source)
         return script
 
-    def toggle_asset_starred(self, script_id: str, asset_id: str, asset_type: str) -> Script:
+    def toggle_asset_starred(
+        self, script_id: str, asset_id: str, asset_type: str
+    ) -> Script:
         """Toggle the starred (asset-library shortlist) status of an asset.
         Mirrors toggle_asset_lock — works on both episode-local and
         series-shared assets via _find_asset_with_source."""
@@ -1078,7 +1458,9 @@ class ComicGenPipeline:
         if not script:
             raise ValueError("Script not found")
 
-        target_asset, source = self._find_asset_with_source(script, asset_id, asset_type)
+        target_asset, source = self._find_asset_with_source(
+            script, asset_id, asset_type
+        )
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
 
@@ -1104,17 +1486,19 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         target_frame = next((f for f in script.frames if f.id == frame_id), None)
         if not target_frame:
             raise ValueError(f"Frame {frame_id} not found")
-            
+
         # Toggle the locked status
         target_frame.locked = not target_frame.locked
         self._save_data()
         return script
 
-    def update_asset_image(self, script_id: str, asset_id: str, asset_type: str, image_url: str) -> Script:
+    def update_asset_image(
+        self, script_id: str, asset_id: str, asset_type: str, image_url: str
+    ) -> Script:
         """Updates the image URL of an asset manually. Per A2 decision,
         series-shared assets are updated in place (shared semantics);
         episode-local assets are updated locally."""
@@ -1122,7 +1506,9 @@ class ComicGenPipeline:
         if not script:
             raise ValueError("Script not found")
 
-        target_asset, source = self._find_asset_with_source(script, asset_id, asset_type)
+        target_asset, source = self._find_asset_with_source(
+            script, asset_id, asset_type
+        )
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
 
@@ -1136,11 +1522,17 @@ class ComicGenPipeline:
         self._save_after_asset_mutation(source)
         return script
 
-    def update_asset_description(self, script_id: str, asset_id: str, asset_type: str, description: str) -> Script:
+    def update_asset_description(
+        self, script_id: str, asset_id: str, asset_type: str, description: str
+    ) -> Script:
         """Updates the description of an asset."""
-        return self.update_asset_attributes(script_id, asset_id, asset_type, {"description": description})
+        return self.update_asset_attributes(
+            script_id, asset_id, asset_type, {"description": description}
+        )
 
-    def update_asset_attributes(self, script_id: str, asset_id: str, asset_type: str, attributes: Dict[str, Any]) -> Script:
+    def update_asset_attributes(
+        self, script_id: str, asset_id: str, asset_type: str, attributes: Dict[str, Any]
+    ) -> Script:
         """Updates arbitrary attributes of an asset. Routes the write
         to either the episode-local or the parent series' shared copy
         depending on which container owns the asset (A2 decision)."""
@@ -1148,7 +1540,9 @@ class ComicGenPipeline:
         if not script:
             raise ValueError("Script not found")
 
-        target_asset, source = self._find_asset_with_source(script, asset_id, asset_type)
+        target_asset, source = self._find_asset_with_source(
+            script, asset_id, asset_type
+        )
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
 
@@ -1163,18 +1557,18 @@ class ComicGenPipeline:
         return script
 
     def add_uploaded_asset_variant(
-        self, 
-        script_id: str, 
-        asset_type: str, 
-        asset_id: str, 
-        upload_type: str, 
-        image_url: str, 
-        description: Optional[str] = None
+        self,
+        script_id: str,
+        asset_type: str,
+        asset_id: str,
+        upload_type: str,
+        image_url: str,
+        description: Optional[str] = None,
     ) -> Script:
         """
         Adds an uploaded image as a new variant to an asset.
         The uploaded image is marked with is_uploaded_source=True.
-        
+
         Args:
             script_id: The project ID
             asset_type: "character", "scene", or "prop"
@@ -1184,36 +1578,38 @@ class ComicGenPipeline:
             description: Optional modified description for reverse generation
         """
         from .models import ImageVariant, AssetUnit
-        
+
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         # Find target asset
         target_asset = None
         if asset_type == "character":
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
         elif asset_type == "scene":
             target_asset = next((s for s in script.scenes if s.id == asset_id), None)
         elif asset_type == "prop":
             target_asset = next((p for p in script.props if p.id == asset_id), None)
-        
+
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
-        
+
         # Create new variant with upload source flag
         new_variant = ImageVariant(
             id=str(uuid.uuid4()),
             url=image_url,
             prompt_used=description or target_asset.description,
             is_uploaded_source=True,
-            upload_type=upload_type
+            upload_type=upload_type,
         )
-        
+
         # Update description if provided
         if description:
             target_asset.description = description
-        
+
         # Add variant to the appropriate asset unit
         if asset_type == "character":
             # Map upload_type to the correct asset unit
@@ -1225,7 +1621,7 @@ class ComicGenPipeline:
                 target_unit = target_asset.three_views
             else:
                 raise ValueError(f"Invalid upload_type for character: {upload_type}")
-            
+
             # Ensure AssetUnit exists
             if target_unit is None:
                 target_unit = AssetUnit()
@@ -1235,12 +1631,12 @@ class ComicGenPipeline:
                     target_asset.head_shot = target_unit
                 elif upload_type == "three_views":
                     target_asset.three_views = target_unit
-            
+
             # Add variant and select it
             target_unit.image_variants.append(new_variant)
             target_unit.selected_image_id = new_variant.id
             target_unit.image_updated_at = time.time()
-            
+
             # === ALSO UPDATE LEGACY FIELDS for frontend compatibility ===
             # Create variant for legacy ImageAsset structure
             legacy_variant = ImageVariant(
@@ -1248,13 +1644,14 @@ class ComicGenPipeline:
                 url=image_url,
                 prompt_used=description or target_asset.description,
                 is_uploaded_source=True,
-                upload_type=upload_type
+                upload_type=upload_type,
             )
-            
+
             if upload_type == "full_body":
                 # Ensure full_body_asset exists
                 if target_asset.full_body_asset is None:
                     from .models import ImageAsset
+
                     target_asset.full_body_asset = ImageAsset()
                 target_asset.full_body_asset.variants.append(legacy_variant)
                 target_asset.full_body_asset.selected_id = new_variant.id
@@ -1263,6 +1660,7 @@ class ComicGenPipeline:
                 # Ensure headshot_asset exists
                 if target_asset.headshot_asset is None:
                     from .models import ImageAsset
+
                     target_asset.headshot_asset = ImageAsset()
                 target_asset.headshot_asset.variants.append(legacy_variant)
                 target_asset.headshot_asset.selected_id = new_variant.id
@@ -1271,58 +1669,72 @@ class ComicGenPipeline:
                 # Ensure three_view_asset exists
                 if target_asset.three_view_asset is None:
                     from .models import ImageAsset
+
                     target_asset.three_view_asset = ImageAsset()
                 target_asset.three_view_asset.variants.append(legacy_variant)
                 target_asset.three_view_asset.selected_id = new_variant.id
                 target_asset.three_view_image_url = image_url
-            
-            logger.info(f"Added uploaded variant {new_variant.id} to character {asset_id} {upload_type}")
-            
+
+            logger.info(
+                f"Added uploaded variant {new_variant.id} to character {asset_id} {upload_type}"
+            )
+
         elif asset_type in ["scene", "prop"]:
             # Scene and Prop have a single 'image' asset unit
-            if not hasattr(target_asset, 'image') or target_asset.image is None:
+            if not hasattr(target_asset, "image") or target_asset.image is None:
                 target_asset.image = AssetUnit()
-            
+
             target_asset.image.image_variants.append(new_variant)
             target_asset.image.selected_image_id = new_variant.id
             target_asset.image.image_updated_at = time.time()
-            
+
             # Also update legacy image_url field
             target_asset.image_url = image_url
-            
-            logger.info(f"Added uploaded variant {new_variant.id} to {asset_type} {asset_id}")
-        
+
+            logger.info(
+                f"Added uploaded variant {new_variant.id} to {asset_type} {asset_id}"
+            )
+
         self._save_data()
         return script
 
-    def update_project_style(self, script_id: str, style_preset: str, style_prompt: Optional[str] = None) -> Script:
+    def update_project_style(
+        self, script_id: str, style_preset: str, style_prompt: Optional[str] = None
+    ) -> Script:
         """Updates the global style settings for a project."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         script.style_preset = style_preset
         script.style_prompt = style_prompt
         script.updated_at = time.time()
         self._save_data()
         return script
-    
-    def save_art_direction(self, script_id: str, selected_style_id: str, style_config: Dict[str, Any], custom_styles: List[Dict[str, Any]] = None, ai_recommendations: List[Dict[str, Any]] = None) -> Script:
+
+    def save_art_direction(
+        self,
+        script_id: str,
+        selected_style_id: str,
+        style_config: Dict[str, Any],
+        custom_styles: List[Dict[str, Any]] = None,
+        ai_recommendations: List[Dict[str, Any]] = None,
+    ) -> Script:
         """Saves the Art Direction configuration."""
         from .models import ArtDirection
-        
+
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         # Create Art Direction object
         art_direction = ArtDirection(
             selected_style_id=selected_style_id,
             style_config=style_config,
             custom_styles=custom_styles or [],
-            ai_recommendations=ai_recommendations or []
+            ai_recommendations=ai_recommendations or [],
         )
-        
+
         script.art_direction = art_direction
         script.updated_at = time.time()
         self._save_data()
@@ -1338,7 +1750,7 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         logger.info(f"Analyzing text to frames for project {script_id}")
 
         # Resolve assets (merge Series + Episode if applicable)
@@ -1349,22 +1761,78 @@ class ComicGenPipeline:
 
         # Build entities JSON from resolved characters, scenes, props
         entities_json = {
-            "characters": [{"id": c.id, "name": c.name, "description": c.description} for c in all_characters],
-            "scenes": [{"id": s.id, "name": s.name, "description": s.description} for s in all_scenes],
-            "props": [{"id": p.id, "name": p.name, "description": p.description} for p in all_props],
+            "characters": [
+                {"id": c.id, "name": c.name, "description": c.description}
+                for c in all_characters
+            ],
+            "scenes": [
+                {"id": s.id, "name": s.name, "description": s.description}
+                for s in all_scenes
+            ],
+            "props": [
+                {"id": p.id, "name": p.name, "description": p.description}
+                for p in all_props
+            ],
         }
 
         # Resolve effective storyboard-extraction prompt (Episode → Series → built-in default).
-        series = self.get_series(script.series_id) if getattr(script, "series_id", None) else None
-        storyboard_extraction_prompt = self.get_effective_prompt("storyboard_extraction", script, series)
+        series = (
+            self.get_series(script.series_id)
+            if getattr(script, "series_id", None)
+            else None
+        )
+        storyboard_extraction_prompt = self.get_effective_prompt(
+            "storyboard_extraction", script, series
+        )
+
+        # Convert raw novel prose into screenplay format first (novel -> screenplay),
+        # otherwise the storyboard extractor returns an empty frames array.
+        analysis_text = text
+        try:
+            looks_like_screenplay = ("△" in text) or ("人物：" in text)
+            if not looks_like_screenplay:
+                converted = self.script_processor.novel_to_screenplay(
+                    text, entities_json
+                )
+                if converted and converted.strip():
+                    analysis_text = converted
+                    logger.info(
+                        "Converted novel to screenplay: %d chars", len(converted)
+                    )
+        except Exception as exc:
+            logger.warning("novel_to_screenplay failed: %s", exc)
 
         # Call LLM to analyze text (may raise RuntimeError on parse failure)
         raw_frames = self.script_processor.analyze_to_storyboard(
-            text, entities_json, custom_extraction_prompt=storyboard_extraction_prompt
+            analysis_text,
+            entities_json,
+            custom_extraction_prompt=storyboard_extraction_prompt,
         )
 
         if not raw_frames:
             raise RuntimeError("AI 分镜分析未返回任何帧数据，请重试。")
+
+        # Verbatim coverage: no source line may be dropped. Backfill missing blocks
+        # by running the same extractor on just the missing lines.
+        try:
+            from .verbatim_check import missing_blocks
+
+            missing = missing_blocks(analysis_text, raw_frames)
+            if missing:
+                logger.warning(
+                    "Verbatim coverage: %d source blocks missing; backfilling",
+                    len(missing),
+                )
+                extra = self.script_processor.analyze_to_storyboard(
+                    "\n".join(missing),
+                    entities_json,
+                    custom_extraction_prompt=storyboard_extraction_prompt,
+                )
+                if extra:
+                    raw_frames.extend(extra)
+                    logger.info("Verbatim backfill added %d frames", len(extra))
+        except Exception as exc:
+            logger.warning("verbatim coverage check failed: %s", exc)
 
         # Convert raw frame dicts to StoryboardFrame objects
         new_frames = []
@@ -1402,28 +1870,39 @@ class ComicGenPipeline:
                     if pname == pn or pn in pname or pname in pn:
                         prop_ids.append(prop.id)
                         break
-            
+
+            _raw_duration = frame_data.get("duration")
+            _duration = None
+            if _raw_duration is not None:
+                try:
+                    _duration = int(float(str(_raw_duration).strip().rstrip("sS")))
+                except Exception:
+                    _digits = "".join(ch for ch in str(_raw_duration) if ch.isdigit())
+                    _duration = int(_digits) if _digits else None
+
             frame = StoryboardFrame(
                 id=str(uuid.uuid4()),
                 scene_id=scene_id,
                 character_ids=character_ids,
                 prop_ids=prop_ids,
-                action_description=frame_data.get("action_summary", frame_data.get("action_description", "")),
+                action_description=frame_data.get(
+                    "action_summary", frame_data.get("action_description", "")
+                ),
                 visual_atmosphere=frame_data.get("visual_atmosphere"),
                 shot_size=frame_data.get("shot_size"),
                 camera_angle=frame_data.get("camera_angle", "平视"),
                 camera_movement=frame_data.get("camera_movement"),
                 dialogue=frame_data.get("dialogue"),
                 speaker=frame_data.get("speaker"),
-                duration=frame_data.get("duration"),
-                status=GenerationStatus.PENDING
+                duration=_duration,
+                status=GenerationStatus.PENDING,
             )
             new_frames.append(frame)
-        
+
         # Replace existing frames with new ones
         script.frames = new_frames
         script.updated_at = time.time()
-        
+
         logger.info(f"Generated {len(new_frames)} frames from text analysis")
         self._save_data()
         return script
@@ -1431,7 +1910,14 @@ class ComicGenPipeline:
     def refine_frame(self, script_id: str, frame_id: str) -> Optional[StoryboardFrame]:
         """Phase 2: Refine a single coarse frame into a rich frame."""
         from .prompt_assembly import assemble_prompt, sync_dialogue_to_tts
-        from .models import DialogueStructured, CameraMovementData, Blocking, AudioNote, LightingData, StageSubject
+        from .models import (
+            DialogueStructured,
+            CameraMovementData,
+            Blocking,
+            AudioNote,
+            LightingData,
+            StageSubject,
+        )
 
         script = self.scripts.get(script_id)
         if not script:
@@ -1455,18 +1941,24 @@ class ComicGenPipeline:
             "dialogue": frame.dialogue,
             "speaker": frame.speaker,
             "duration": frame.duration,
-            "character_names": [c.name for c in all_characters if c.id in frame.character_ids],
-            "scene_name": next((s.name for s in all_scenes if s.id == frame.scene_id), None),
+            "character_names": [
+                c.name for c in all_characters if c.id in frame.character_ids
+            ],
+            "scene_name": next(
+                (s.name for s in all_scenes if s.id == frame.scene_id), None
+            ),
         }
 
         # Character/scene assets
         char_assets = [
             {"name": c.name, "description": c.description, "clothing": c.clothing or ""}
-            for c in all_characters if c.id in frame.character_ids
+            for c in all_characters
+            if c.id in frame.character_ids
         ]
         scene_assets = [
             {"name": s.name, "description": s.description}
-            for s in all_scenes if s.id == frame.scene_id
+            for s in all_scenes
+            if s.id == frame.scene_id
         ]
 
         # Adjacent frame context
@@ -1488,6 +1980,7 @@ class ComicGenPipeline:
         # Map result onto frame fields
         if result.get("visual_description"):
             from .prompt_assembly import inject_reference_tags
+
             frame.visual_description = inject_reference_tags(
                 result["visual_description"], frame, all_characters, all_scenes
             )
@@ -1524,7 +2017,8 @@ class ComicGenPipeline:
                         facing=s.get("facing"),
                         posture=s.get("posture"),
                     )
-                    for s in blk["stage"] if isinstance(s, dict)
+                    for s in blk["stage"]
+                    if isinstance(s, dict)
                 ]
             frame.blocking = Blocking(
                 description=blk["description"],
@@ -1553,7 +2047,11 @@ class ComicGenPipeline:
 
         # Lighting
         lt = result.get("lighting")
-        if lt and isinstance(lt, dict) and (lt.get("description") or lt.get("direction")):
+        if (
+            lt
+            and isinstance(lt, dict)
+            and (lt.get("description") or lt.get("direction"))
+        ):
             frame.lighting = LightingData(
                 direction=lt.get("direction"),
                 quality=lt.get("quality"),
@@ -1580,34 +2078,52 @@ class ComicGenPipeline:
         failed = 0
 
         for idx, frame in enumerate(script.frames):
-            yield ("frame_refine_start", {
-                "frame_id": frame.id,
-                "frame_index": idx,
-                "total": total,
-                "label": frame.action_description[:40] if frame.action_description else f"Frame {idx+1}",
-            })
-            try:
-                self.refine_frame(script_id, frame.id)
-                success += 1
-                yield ("frame_refine_complete", {
+            yield (
+                "frame_refine_start",
+                {
                     "frame_id": frame.id,
                     "frame_index": idx,
                     "total": total,
-                })
+                    "label": frame.action_description[:40]
+                    if frame.action_description
+                    else f"Frame {idx + 1}",
+                },
+            )
+            try:
+                self.refine_frame(script_id, frame.id)
+                success += 1
+                yield (
+                    "frame_refine_complete",
+                    {
+                        "frame_id": frame.id,
+                        "frame_index": idx,
+                        "total": total,
+                    },
+                )
             except Exception as exc:
                 failed += 1
                 logger.error(f"[refine_batch] frame={frame.id} error={exc}")
-                yield ("frame_refine_error", {
-                    "frame_id": frame.id,
-                    "frame_index": idx,
-                    # Don't leak exception details to the client (CodeQL
-                    # py/stack-trace-exposure); full error is in the log above.
-                    "error": f"分镜优化失败（{type(exc).__name__}），详情请查看服务端日志",
-                })
+                yield (
+                    "frame_refine_error",
+                    {
+                        "frame_id": frame.id,
+                        "frame_index": idx,
+                        # Don't leak exception details to the client (CodeQL
+                        # py/stack-trace-exposure); full error is in the log above.
+                        "error": f"分镜优化失败（{type(exc).__name__}），详情请查看服务端日志",
+                    },
+                )
 
         yield ("batch_complete", {"total": total, "success": success, "failed": failed})
 
-    def refine_frame_prompt(self, script_id: str, frame_id: str, raw_prompt: str, assets: List[Dict[str, Any]], feedback: str = "") -> Dict[str, Any]:
+    def refine_frame_prompt(
+        self,
+        script_id: str,
+        frame_id: str,
+        raw_prompt: str,
+        assets: List[Dict[str, Any]],
+        feedback: str = "",
+    ) -> Dict[str, Any]:
         """
         Refines a raw prompt into bilingual (CN/EN) prompts using LLM.
         Also updates the frame with the refined prompts.
@@ -1623,12 +2139,15 @@ class ComicGenPipeline:
         custom_prompt = self.get_effective_prompt("storyboard_polish", script, series)
         # If it's the system default, pass empty so the LLM method uses its built-in default
         from .llm import DEFAULT_STORYBOARD_POLISH_PROMPT
+
         if custom_prompt == DEFAULT_STORYBOARD_POLISH_PROMPT:
             custom_prompt = ""
 
         # Call LLM to refine prompt
-        result = self.script_processor.polish_storyboard_prompt(raw_prompt, assets, feedback, custom_prompt)
-        
+        result = self.script_processor.polish_storyboard_prompt(
+            raw_prompt, assets, feedback, custom_prompt
+        )
+
         # Find and update the frame
         frame_found = False
         for frame in script.frames:
@@ -1639,14 +2158,14 @@ class ComicGenPipeline:
                 frame.updated_at = time.time()
                 frame_found = True
                 break
-        
+
         if frame_found:
             self._save_data()
-        
+
         return {
             "prompt_cn": result.get("prompt_cn"),
             "prompt_en": result.get("prompt_en"),
-            "frame_updated": frame_found
+            "frame_updated": frame_found,
         }
 
     def generate_storyboard(self, script_id: str) -> Script:
@@ -1654,7 +2173,7 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         resolved = self.resolve_episode_assets(script)
         script = self.storyboard_generator.generate_storyboard(
             script,
@@ -1669,86 +2188,100 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         frame = next((f for f in script.frames if f.id == frame_id), None)
         if not frame:
             raise ValueError(f"Frame {frame_id} not found")
-        
+
         # Update only provided fields
-        if kwargs.get('image_prompt') is not None:
-            frame.image_prompt = kwargs['image_prompt']
-        if kwargs.get('action_description') is not None:
-            frame.action_description = kwargs['action_description']
-        if kwargs.get('dialogue') is not None:
-            frame.dialogue = kwargs['dialogue']
-        if kwargs.get('camera_angle') is not None:
-            frame.camera_angle = kwargs['camera_angle']
-        if kwargs.get('scene_id') is not None:
-            frame.scene_id = kwargs['scene_id']
-        if kwargs.get('character_ids') is not None:
-            frame.character_ids = kwargs['character_ids']
-        if kwargs.get('duration') is not None:
-            frame.duration = kwargs['duration']
-        if kwargs.get('shot_size') is not None:
-            frame.shot_size = kwargs['shot_size']
-        if kwargs.get('camera_movement_description') is not None:
+        if kwargs.get("image_prompt") is not None:
+            frame.image_prompt = kwargs["image_prompt"]
+        if kwargs.get("action_description") is not None:
+            frame.action_description = kwargs["action_description"]
+        if kwargs.get("dialogue") is not None:
+            frame.dialogue = kwargs["dialogue"]
+        if kwargs.get("camera_angle") is not None:
+            frame.camera_angle = kwargs["camera_angle"]
+        if kwargs.get("scene_id") is not None:
+            frame.scene_id = kwargs["scene_id"]
+        if kwargs.get("character_ids") is not None:
+            frame.character_ids = kwargs["character_ids"]
+        if kwargs.get("duration") is not None:
+            frame.duration = kwargs["duration"]
+        if kwargs.get("shot_size") is not None:
+            frame.shot_size = kwargs["shot_size"]
+        if kwargs.get("camera_movement_description") is not None:
             if frame.camera_movement_structured:
-                frame.camera_movement_structured.description = kwargs['camera_movement_description']
-                frame.camera_movement_structured.primary = kwargs['camera_movement_description']
+                frame.camera_movement_structured.description = kwargs[
+                    "camera_movement_description"
+                ]
+                frame.camera_movement_structured.primary = kwargs[
+                    "camera_movement_description"
+                ]
             else:
                 from .models import CameraMovementData
+
                 frame.camera_movement_structured = CameraMovementData(
-                    primary=kwargs['camera_movement_description'],
+                    primary=kwargs["camera_movement_description"],
                     speed="normal",
-                    description=kwargs['camera_movement_description'],
+                    description=kwargs["camera_movement_description"],
                 )
-        if kwargs.get('transition_hint') is not None:
-            frame.transition_hint = kwargs['transition_hint']
-        
+        if kwargs.get("transition_hint") is not None:
+            frame.transition_hint = kwargs["transition_hint"]
+
         self._save_data()
         return script
 
-    def add_frame(self, script_id: str, scene_id: str = None, action_description: str = "", camera_angle: str = "medium_shot", insert_at: int = None) -> Script:
+    def add_frame(
+        self,
+        script_id: str,
+        scene_id: str = None,
+        action_description: str = "",
+        camera_angle: str = "medium_shot",
+        insert_at: int = None,
+    ) -> Script:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         new_frame = StoryboardFrame(
             id=f"frame_{uuid.uuid4().hex[:8]}",
             scene_id=scene_id or (script.scenes[0].id if script.scenes else ""),
             character_ids=[],
             action_description=action_description,
-            camera_angle=camera_angle
+            camera_angle=camera_angle,
         )
-        
+
         if insert_at is not None and 0 <= insert_at <= len(script.frames):
             script.frames.insert(insert_at, new_frame)
         else:
             script.frames.append(new_frame)
-            
+
         self._save_data()
         return script
 
-    def copy_frame(self, script_id: str, frame_id: str, insert_at: int = None) -> Script:
+    def copy_frame(
+        self, script_id: str, frame_id: str, insert_at: int = None
+    ) -> Script:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         original_frame = next((f for f in script.frames if f.id == frame_id), None)
         if not original_frame:
             raise ValueError(f"Frame {frame_id} not found")
-            
+
         # Create a deep copy with new ID
         new_frame = original_frame.copy()
         new_frame.id = f"frame_{uuid.uuid4().hex[:8]}"
         new_frame.updated_at = time.time()
-        # Reset generation status and URLs for the copy? 
+        # Reset generation status and URLs for the copy?
         # Usually copy implies copying content, but maybe we want to keep the image?
         # Let's keep the image/content but reset status if it was processing?
         # Actually, if we copy, we probably want the same image reference initially.
         # But we should reset the "locked" status maybe?
         new_frame.locked = False
-        
+
         if insert_at is not None and 0 <= insert_at <= len(script.frames):
             script.frames.insert(insert_at, new_frame)
         else:
@@ -1758,7 +2291,7 @@ class ComicGenPipeline:
                 script.frames.insert(original_index + 1, new_frame)
             except ValueError:
                 script.frames.append(new_frame)
-                
+
         self._save_data()
         return script
 
@@ -1766,7 +2299,7 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         script.frames = [f for f in script.frames if f.id != frame_id]
         self._save_data()
         return script
@@ -1775,13 +2308,13 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         frame_map = {f.id: f for f in script.frames}
         new_frames = []
         for fid in frame_ids:
             if fid in frame_map:
                 new_frames.append(frame_map[fid])
-        
+
         script.frames = new_frames
         self._save_data()
         return script
@@ -1794,7 +2327,7 @@ class ComicGenPipeline:
         prompt: Optional[str] = None,
         audio_url: Optional[str] = None,
         duration: int = 5,
-        batch_size: int = 1
+        batch_size: int = 1,
     ) -> Script:
         """Generate Motion Reference video for an asset (Character Full Body/Headshot, Scene, or Prop).
 
@@ -1819,7 +2352,9 @@ class ComicGenPipeline:
 
         if asset_type in ["full_body", "head_shot"]:
             # Find the character
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
             asset_display_name = "Character"
         elif asset_type == "scene":
             # Find the scene
@@ -1830,7 +2365,9 @@ class ComicGenPipeline:
             target_asset = next((p for p in script.props if p.id == asset_id), None)
             asset_display_name = "Prop"
         else:
-            raise ValueError(f"Invalid asset_type: {asset_type}. Must be 'full_body', 'head_shot', 'scene', or 'prop'")
+            raise ValueError(
+                f"Invalid asset_type: {asset_type}. Must be 'full_body', 'head_shot', 'scene', or 'prop'"
+            )
 
         if not target_asset:
             raise ValueError(f"{asset_display_name} {asset_id} not found")
@@ -1845,15 +2382,26 @@ class ComicGenPipeline:
             # Get source image from the AssetUnit or legacy field
             if asset_unit and asset_unit.selected_image_id:
                 source_img = next(
-                    (v for v in asset_unit.image_variants if v.id == asset_unit.selected_image_id),
-                    None
+                    (
+                        v
+                        for v in asset_unit.image_variants
+                        if v.id == asset_unit.selected_image_id
+                    ),
+                    None,
                 )
-                source_image_url = source_img.url if source_img else (
-                    target_asset.full_body_image_url if asset_type == "full_body" else target_asset.headshot_image_url
+                source_image_url = (
+                    source_img.url
+                    if source_img
+                    else (
+                        target_asset.full_body_image_url
+                        if asset_type == "full_body"
+                        else target_asset.headshot_image_url
+                    )
                 )
             else:
                 source_image_url = (
-                    target_asset.full_body_image_url if asset_type == "full_body"
+                    target_asset.full_body_image_url
+                    if asset_type == "full_body"
                     else target_asset.headshot_image_url
                 )
 
@@ -1881,7 +2429,9 @@ class ComicGenPipeline:
 
         # Check if source image exists
         if not source_image_url:
-            raise ValueError(f"No source image available for {asset_type}. Please generate a static image first.")
+            raise ValueError(
+                f"No source image available for {asset_type}. Please generate a static image first."
+            )
 
         # Generate videos based on the asset type
         for i in range(batch_size):
@@ -1891,7 +2441,7 @@ class ComicGenPipeline:
                     image_url=source_image_url,
                     prompt=prompt,
                     duration=duration,
-                    audio_url=audio_url
+                    audio_url=audio_url,
                 )
 
                 if video_result and video_result.get("video_url"):
@@ -1902,7 +2452,7 @@ class ComicGenPipeline:
                             url=video_result["video_url"],
                             prompt_used=prompt,
                             audio_url=audio_url,
-                            source_image_id=None  # Don't set this to avoid complications
+                            source_image_id=None,  # Don't set this to avoid complications
                         )
                         asset_unit.video_variants.append(video_variant)
 
@@ -1926,15 +2476,19 @@ class ComicGenPipeline:
                             created_at=time.time(),
                             generate_audio=bool(audio_url),
                             model="wan2.6-i2v",
-                            generation_mode="i2v"  # Image to video (motion reference)
+                            generation_mode="i2v",  # Image to video (motion reference)
                         )
 
                         # Add to the asset's video_assets
                         target_asset.video_assets.append(video_task)
                         generated_videos.append(video_task)
-                        logger.info(f"Generated motion ref video for {asset_type}: {video_task.id}")
+                        logger.info(
+                            f"Generated motion ref video for {asset_type}: {video_task.id}"
+                        )
             except Exception as e:
-                logger.error(f"Failed to generate motion ref video for {asset_type}: {e}")
+                logger.error(
+                    f"Failed to generate motion ref video for {asset_type}: {e}"
+                )
 
         # For character assets, update the AssetUnit
         if asset_type in ["full_body", "head_shot"]:
@@ -1948,38 +2502,47 @@ class ComicGenPipeline:
         # For scene and prop assets, the video tasks are already added in the generation loop above
 
         if batch_size > 0 and not generated_videos:
-            raise RuntimeError(f"Failed to generate any motion reference videos for {asset_type}")
+            raise RuntimeError(
+                f"Failed to generate any motion reference videos for {asset_type}"
+            )
 
         self._save_data()
         return script
 
-    def generate_storyboard_render(self, script_id: str, frame_id: str, composition_data: Optional[Dict[str, Any]], prompt: str, batch_size: int = 1) -> Script:
+    def generate_storyboard_render(
+        self,
+        script_id: str,
+        frame_id: str,
+        composition_data: Optional[Dict[str, Any]],
+        prompt: str,
+        batch_size: int = 1,
+    ) -> Script:
         """Step 3b: Render a specific frame from composition data."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         frame = next((f for f in script.frames if f.id == frame_id), None)
         if not frame:
             raise ValueError(f"Frame {frame_id} not found")
-            
+
         frame.status = GenerationStatus.PROCESSING
         if composition_data:
             frame.composition_data = composition_data
         frame.image_prompt = prompt
         self._save_data()
-        
+
         try:
             # Extract reference image URL from composition data if available
             ref_image_url = None
             ref_image_urls = []
-            
+
             if composition_data:
-                ref_image_url = composition_data.get('reference_image_url')
-                ref_image_urls = composition_data.get('reference_image_urls', [])
-            
+                ref_image_url = composition_data.get("reference_image_url")
+                ref_image_urls = composition_data.get("reference_image_urls", [])
+
             ref_image_paths = []
-            
+
             # Resolve multiple paths
             for url in ref_image_urls:
                 if not url:
@@ -1990,7 +2553,7 @@ class ComicGenPipeline:
                     potential_path = _safe_resolve_path("output", url)
                     if os.path.exists(potential_path):
                         ref_image_paths.append(potential_path)
-            
+
             # Also handle single path if provided (legacy support)
             if ref_image_url and ref_image_url not in ref_image_urls:
                 if is_object_key(ref_image_url) or ref_image_url.startswith("http"):
@@ -2001,31 +2564,38 @@ class ComicGenPipeline:
                     if os.path.exists(potential_path):
                         if potential_path not in ref_image_paths:
                             ref_image_paths.append(potential_path)
-            
+
             # Use the first path as ref_image_path for legacy generator support if needed
             ref_image_path = ref_image_paths[0] if ref_image_paths else None
-            
+
             # Use the prompt as-is from frontend (already contains style)
             final_prompt = prompt
-            
+
             # Update frame with final prompt
             frame.image_prompt = final_prompt
-            
+
             # Resolve assets across Episode → Series → Global layers so
             # shared/global characters & scenes are usable when rendering
             # this frame (frame id references are left unchanged).
             resolved = self.resolve_episode_assets(script)
             # Find scene for this frame
-            scene = next((s for s in resolved["scenes"] if s.id == frame.scene_id), None)
+            scene = next(
+                (s for s in resolved["scenes"] if s.id == frame.scene_id), None
+            )
 
             # Get effective size from storyboard_aspect_ratio
             from .assets import ASPECT_RATIO_TO_SIZE
+
             storyboard_aspect_ratio = script.model_settings.storyboard_aspect_ratio
-            effective_size = ASPECT_RATIO_TO_SIZE.get(storyboard_aspect_ratio, "1024*576")  # Default to landscape
-            
+            effective_size = ASPECT_RATIO_TO_SIZE.get(
+                storyboard_aspect_ratio, "1024*576"
+            )  # Default to landscape
+
             # Use model from settings
             i2i_model = script.model_settings.i2i_model
-            logger.info(f"Rendering frame {frame_id} using model {i2i_model} with {len(ref_image_paths)} reference images")
+            logger.info(
+                f"Rendering frame {frame_id} using model {i2i_model} with {len(ref_image_paths)} reference images"
+            )
             if len(ref_image_urls) > 0:
                 logger.debug(f"Original reference URLs from frontend: {ref_image_urls}")
 
@@ -2039,9 +2609,9 @@ class ComicGenPipeline:
                 prompt=final_prompt,
                 batch_size=batch_size,
                 size=effective_size,
-                model_name=i2i_model
+                model_name=i2i_model,
             )
-            
+
             self._save_data()
             return script
         except Exception as e:
@@ -2051,20 +2621,20 @@ class ComicGenPipeline:
             # 1. Take the composition_data (positions of assets)
             # 2. Construct a composite image (ControlNet input)
             # 3. Call Img2Img with the composite + prompt
-            
+
             logger.debug(f"Rendering frame {frame_id} with prompt: {prompt}")
-            time.sleep(1.5) # Simulate processing
-            
+            time.sleep(1.5)  # Simulate processing
+
             # Mock Result
             mock_url = f"https://placehold.co/1280x720/2a2a2a/FFF?text=Rendered+Frame+{frame_id}"
             frame.rendered_image_url = mock_url
-            frame.image_url = mock_url # Update main image too
+            frame.image_url = mock_url  # Update main image too
             frame.status = GenerationStatus.COMPLETED
-            
+
         except Exception as e:
             logger.error(f"Frame rendering failed: {e}")
             frame.status = GenerationStatus.FAILED
-            
+
         self._save_data()
         return script
 
@@ -2073,19 +2643,138 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         script = self.video_generator.generate_video(script)
         self._save_data()
         return script
 
-    def create_video_task(self, script_id: str, image_url: str, prompt: str, duration: int = 5, seed: int = None, resolution: str = "720p", generate_audio: bool = False, audio_url: str = None, prompt_extend: bool = True, negative_prompt: str = None, model: str = "wan2.7-i2v", frame_id: str = None, shot_type: str = "single", generation_mode: str = "i2v", reference_video_urls: list = None, reference_image_urls: list = None, ratio: str = None, watermark: Optional[bool] = None, mode: str = None, sound: str = None, cfg_scale: float = None, vidu_audio: bool = None, movement_amplitude: str = None, workbench_tab: Optional[str] = None) -> Tuple[Script, str]:
+    def create_auto_motion_tasks(self, script_id: str) -> list:
+        """Group rendered storyboard frames into shots and create I2V tasks for each shot."""
+        script = self.get_script(script_id)
+        if not script:
+            raise ValueError("Script not found")
+
+        def rendered_url(frame):
+            unit = getattr(frame, "rendered_image_asset", None)
+            variants = getattr(unit, "variants", None) or []
+            if variants:
+                if getattr(unit, "selected_id", None):
+                    chosen = next(
+                        (v for v in variants if v.id == unit.selected_id), None
+                    )
+                    if chosen:
+                        return chosen.url
+                return variants[-1].url
+            return getattr(frame, "image_url", None)
+
+        def size_cat(shot_size):
+            text = shot_size or ""
+            if any(k in text for k in ("特写", "近景")):
+                return "close"
+            if any(k in text for k in ("全景", "远景")):
+                return "wide"
+            return "medium"
+
+        groups = []
+        current = []
+        prev_key = None
+        for frame in script.frames or []:
+            url = rendered_url(frame)
+            key = (frame.scene_id, size_cat(frame.shot_size))
+            if current and (
+                key != prev_key or len(current) >= 3 or current[-1].dialogue
+            ):
+                groups.append(current)
+                current = []
+            if url:
+                current.append(frame)
+            prev_key = key
+        if current:
+            groups.append(current)
+
+        existing_frames = {
+            t.frame_id
+            for t in (getattr(script, "video_tasks", None) or [])
+            if getattr(t, "frame_id", None)
+            and t.status in ("pending", "processing", "completed")
+        }
+        failed_by_frame = {
+            t.frame_id: t
+            for t in (getattr(script, "video_tasks", None) or [])
+            if getattr(t, "frame_id", None) and t.status == "failed"
+        }
+        retried = 0
+        task_ids = []
+        for group in groups:
+            target = next((f for f in group if rendered_url(f)), None)
+            if not target:
+                continue
+            if target.id in existing_frames:
+                continue
+            if target.id in failed_by_frame:
+                task = failed_by_frame[target.id]
+                task.status = "pending"
+                task.error = None
+                task_ids.append(task.id)
+                retried += 1
+                continue
+            prompt = (
+                target.image_prompt_en
+                or target.image_prompt
+                or target.visual_description
+                or target.action_description
+                or ""
+            )
+            duration = min(10, max(3, 2 * len(group)))
+            _, task_id = self.create_video_task(
+                script_id=script_id,
+                image_url=rendered_url(target),
+                prompt=prompt,
+                duration=duration,
+                frame_id=target.id,
+                model="wan2.6-i2v",
+                generation_mode="i2v",
+            )
+            task_ids.append(task_id)
+        if retried:
+            self._save_data()
+            logger.info("Auto motion retrying %d failed tasks", retried)
+        return task_ids
+
+    def create_video_task(
+        self,
+        script_id: str,
+        image_url: str,
+        prompt: str,
+        duration: int = 5,
+        seed: int = None,
+        resolution: str = "720p",
+        generate_audio: bool = False,
+        audio_url: str = None,
+        prompt_extend: bool = True,
+        negative_prompt: str = None,
+        model: str = "wan2.7-i2v",
+        frame_id: str = None,
+        shot_type: str = "single",
+        generation_mode: str = "i2v",
+        reference_video_urls: list = None,
+        reference_image_urls: list = None,
+        ratio: str = None,
+        watermark: Optional[bool] = None,
+        mode: str = None,
+        sound: str = None,
+        cfg_scale: float = None,
+        vidu_audio: bool = None,
+        movement_amplitude: str = None,
+        workbench_tab: Optional[str] = None,
+    ) -> Tuple[Script, str]:
         """Creates a new video generation task."""
         script = self.get_script(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         task_id = str(uuid.uuid4())
-        
+
         # If R2V mode is selected, use the appropriate R2V model
         if generation_mode == "r2v":
             # Skip auto-switch if user already selected an R2V model directly
@@ -2123,7 +2812,8 @@ class ComicGenPipeline:
         if is_r2v_model:
             needs_video_refs = model == "wan2.6-r2v"
             refs = (
-                (reference_video_urls or []) if needs_video_refs
+                (reference_video_urls or [])
+                if needs_video_refs
                 else (reference_image_urls or [])
             )
             if not refs:
@@ -2152,11 +2842,12 @@ class ComicGenPipeline:
                     _validate_safe_id(task_id, "task_id")
                     snapshot_filename = f"{task_id}{ext}"
                     snapshot_path = _safe_resolve_path(snapshot_dir, snapshot_filename)
-                    
+
                     # Copy file
                     import shutil
+
                     shutil.copy2(src_path, snapshot_path)
-                    
+
                     # Update URL to relative path
                     snapshot_url = f"video_inputs/{snapshot_filename}"
         except Exception as e:
@@ -2169,6 +2860,7 @@ class ComicGenPipeline:
             frame = next((f for f in script.frames if f.id == frame_id), None)
             if frame:
                 from .prompt_assembly import enrich_prompt_with_dialogue
+
                 prompt = enrich_prompt_with_dialogue(prompt, frame)
 
         task = VideoTask(
@@ -2198,7 +2890,7 @@ class ComicGenPipeline:
             vidu_audio=vidu_audio,
             movement_amplitude=movement_amplitude,
             workbench_tab=workbench_tab,
-            created_at=time.time()
+            created_at=time.time(),
         )
 
         if not script.video_tasks:
@@ -2208,7 +2900,9 @@ class ComicGenPipeline:
         self._save_data()
         return script, task_id
 
-    def extract_last_frame(self, script_id: str, frame_id: str, video_task_id: str) -> Script:
+    def extract_last_frame(
+        self, script_id: str, frame_id: str, video_task_id: str
+    ) -> Script:
         """Extract the last frame from a video task and add it as a variant of the frame's rendered_image_asset."""
         from .models import ImageVariant, ImageAsset
 
@@ -2221,8 +2915,14 @@ class ComicGenPipeline:
             raise ValueError("Frame not found")
 
         # Find the video task
-        video_task = next((t for t in script.video_tasks if t.id == video_task_id), None)
-        if not video_task or video_task.status != "completed" or not video_task.video_url:
+        video_task = next(
+            (t for t in script.video_tasks if t.id == video_task_id), None
+        )
+        if (
+            not video_task
+            or video_task.status != "completed"
+            or not video_task.video_url
+        ):
             raise ValueError("Video task not found or not completed")
 
         # Resolve video path (managed output/ files, temp downloads, or URLs)
@@ -2235,7 +2935,9 @@ class ComicGenPipeline:
             resolved = os.path.realpath(video_path)
             out_base = os.path.realpath("output")
             if not resolved.startswith(out_base + os.sep):
-                raise ValueError(f"Video path outside managed output directory: {video_task.video_url}")
+                raise ValueError(
+                    f"Video path outside managed output directory: {video_task.video_url}"
+                )
             video_path = resolved
         else:
             video_path = _safe_resolve_path("output", video_path)
@@ -2246,7 +2948,9 @@ class ComicGenPipeline:
         # Extract last frame using FFmpeg
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
-            raise RuntimeError("FFmpeg is required for frame extraction but was not found.")
+            raise RuntimeError(
+                "FFmpeg is required for frame extraction but was not found."
+            )
 
         output_dir = os.path.join("output", "storyboard")
         os.makedirs(output_dir, exist_ok=True)
@@ -2257,11 +2961,17 @@ class ComicGenPipeline:
         output_path = _safe_resolve_path(output_dir, output_filename)
 
         cmd = [
-            ffmpeg_path, "-sseof", "-0.1",
-            "-i", video_path,
-            "-frames:v", "1",
-            "-q:v", "2",
-            "-y", output_path
+            ffmpeg_path,
+            "-sseof",
+            "-0.1",
+            "-i",
+            video_path,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+            output_path,
         ]
 
         try:
@@ -2276,6 +2986,7 @@ class ComicGenPipeline:
 
         # Upload to OSS if configured
         from ...utils.oss_utils import OSSImageUploader
+
         uploader = OSSImageUploader()
         oss_url = uploader.upload_image(output_path)
         image_url = oss_url if oss_url else os.path.relpath(output_path, "output")
@@ -2302,12 +3013,19 @@ class ComicGenPipeline:
         self._save_data()
         return script
 
-    def upload_frame_image(self, script_id: str, frame_id: str, image_path: str) -> Script:
+    def upload_frame_image(
+        self, script_id: str, frame_id: str, image_path: str
+    ) -> Script:
         """Upload an image as a variant of the frame's rendered_image_asset."""
         from .models import ImageVariant, ImageAsset
 
         # Validate that image_path is inside the output directory
-        safe_path = _safe_resolve_path("output", os.path.relpath(image_path, "output") if os.path.isabs(image_path) else image_path)
+        safe_path = _safe_resolve_path(
+            "output",
+            os.path.relpath(image_path, "output")
+            if os.path.isabs(image_path)
+            else image_path,
+        )
 
         script = self.get_script(script_id)
         if not script:
@@ -2319,6 +3037,7 @@ class ComicGenPipeline:
 
         # Upload to OSS if configured
         from ...utils.oss_utils import OSSImageUploader
+
         uploader = OSSImageUploader()
         oss_url = uploader.upload_image(safe_path)
         image_url = oss_url if oss_url else os.path.relpath(safe_path, "output")
@@ -2348,28 +3067,31 @@ class ComicGenPipeline:
         """Downloads an image to a temporary file."""
         import requests
         import tempfile
-        
+
         # If it's a local file path (relative to output)
         if not url.startswith("http"):
             local_path = _safe_resolve_path("output", url)
             if os.path.exists(local_path):
                 return local_path
-                
+
         # Download from URL
         try:
             response = requests.get(url, stream=True)
             response.raise_for_status()
-            
+
             # Create temp file
             fd, path = tempfile.mkstemp(suffix=".png")
-            with os.fdopen(fd, 'wb') as f:
+            with os.fdopen(fd, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
             return path
         except Exception as e:
             logger.error(f"Failed to download image: {e}")
             raise
-    def select_video_for_frame(self, script_id: str, frame_id: str, video_id: str) -> Script:
+
+    def select_video_for_frame(
+        self, script_id: str, frame_id: str, video_id: str
+    ) -> Script:
         """Manual select: user pins this video as the active take.
 
         Sets is_video_pinned=True so subsequent auto_select_latest_video
@@ -2421,7 +3143,8 @@ class ComicGenPipeline:
         # complete in arrival order — close enough for "show me what just
         # came out" UX.
         frame_tasks = [
-            t for t in script.video_tasks
+            t
+            for t in script.video_tasks
             if t.frame_id == frame_id
             and t.status == GenerationStatus.COMPLETED
             and t.video_url
@@ -2481,6 +3204,7 @@ class ComicGenPipeline:
             # Not found locally — might be an OSS object key
             if is_object_key(url):
                 from ...utils.oss_utils import OSSImageUploader
+
                 uploader = OSSImageUploader()
                 if uploader.is_configured:
                     url = uploader.sign_url_for_api(url)
@@ -2492,6 +3216,7 @@ class ComicGenPipeline:
 
         # Case 2 & 3: Download from HTTP URL
         import hashlib
+
         url_hash = hashlib.md5(url.split("?")[0].encode()).hexdigest()[:12]
         cache_dir = os.path.join("output", "cache")
         os.makedirs(cache_dir, exist_ok=True)
@@ -2500,6 +3225,7 @@ class ComicGenPipeline:
             return cached
         try:
             import requests
+
             resp = requests.get(url, stream=True, timeout=60)
             resp.raise_for_status()
             with open(cached, "wb") as f:
@@ -2517,6 +3243,7 @@ class ComicGenPipeline:
         """Pre-download htdemucs model at startup so first dub request is fast."""
         try:
             from demucs.pretrained import get_model
+
             get_model("htdemucs")
             logger.info("[DUB] Demucs htdemucs model ready")
             self._demucs_ready.set()
@@ -2525,7 +3252,9 @@ class ComicGenPipeline:
             self._demucs_ready.set()
             logger.warning(f"[DUB] Demucs model warmup failed: {e}")
 
-    def _separate_background_audio(self, video_path: str, work_dir: str) -> Optional[str]:
+    def _separate_background_audio(
+        self, video_path: str, work_dir: str
+    ) -> Optional[str]:
         """Extract audio from video and separate background (no_vocals) using Demucs.
 
         Returns the path to the background audio WAV file, or None if
@@ -2536,15 +3265,25 @@ class ComicGenPipeline:
 
         # Step 1: Extract audio from video
         extract_cmd = [
-            ffmpeg_path, "-y",
-            "-i", video_path,
-            "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            ffmpeg_path,
+            "-y",
+            "-i",
+            video_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
             extracted_audio,
         ]
         try:
             result = subprocess.run(extract_cmd, capture_output=True, timeout=30)
             if result.returncode != 0 or not os.path.exists(extracted_audio):
-                logger.warning("[DUB] No audio track in source video, skipping separation")
+                logger.warning(
+                    "[DUB] No audio track in source video, skipping separation"
+                )
                 return None
         except Exception as e:
             logger.warning(f"[DUB] Audio extraction failed: {e}")
@@ -2562,14 +3301,22 @@ class ComicGenPipeline:
 
         try:
             import demucs.separate
-            demucs.separate.main([
-                "--two-stems", "vocals",
-                "-n", "htdemucs",
-                "--out", work_dir,
-                extracted_audio,
-            ])
+
+            demucs.separate.main(
+                [
+                    "--two-stems",
+                    "vocals",
+                    "-n",
+                    "htdemucs",
+                    "--out",
+                    work_dir,
+                    extracted_audio,
+                ]
+            )
         except Exception as e:
-            logger.warning(f"[DUB] Demucs separation failed: {e}, falling back to simple replacement")
+            logger.warning(
+                f"[DUB] Demucs separation failed: {e}, falling back to simple replacement"
+            )
             return None
 
         # Demucs outputs to: {work_dir}/htdemucs/original_audio/no_vocals.wav
@@ -2585,10 +3332,14 @@ class ComicGenPipeline:
             logger.info(f"[DUB] Background audio separated successfully: {bg_path}")
             return bg_path
 
-        logger.warning("[DUB] Demucs output not found, falling back to simple replacement")
+        logger.warning(
+            "[DUB] Demucs output not found, falling back to simple replacement"
+        )
         return None
 
-    def _ensure_bg_audio_cached(self, frame, video_path: str, video_url: str) -> Optional[str]:
+    def _ensure_bg_audio_cached(
+        self, frame, video_path: str, video_url: str
+    ) -> Optional[str]:
         """Ensure background audio is separated and cached for this frame's video.
 
         Returns absolute path to bg audio WAV, or None if video has no audio.
@@ -2603,6 +3354,7 @@ class ComicGenPipeline:
 
         import tempfile
         import shutil
+
         work_dir = tempfile.mkdtemp(prefix="demucs_")
         try:
             bg_path = self._separate_background_audio(video_path, work_dir)
@@ -2612,7 +3364,9 @@ class ComicGenPipeline:
                 return None
 
             cache_filename = f"bg_{frame.id}.wav"
-            cache_path = _safe_resolve_path(os.path.join("output", "audio"), cache_filename)
+            cache_path = _safe_resolve_path(
+                os.path.join("output", "audio"), cache_filename
+            )
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             shutil.copy2(bg_path, cache_path)
 
@@ -2623,7 +3377,9 @@ class ComicGenPipeline:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    def preview_dub(self, script_id: str, frame_id: str, video_task_id: str, offset_ms: int = 0) -> "Script":
+    def preview_dub(
+        self, script_id: str, frame_id: str, video_task_id: str, offset_ms: int = 0
+    ) -> "Script":
         """Generate a preview dubbed video (Demucs cached + fast adelay+amix+mux).
 
         Replaces any existing preview_video_url (lazy cleanup).
@@ -2641,15 +3397,23 @@ class ComicGenPipeline:
             raise ValueError(f"Frame {frame_id} not found")
 
         if not frame.audio_url:
-            raise ValueError("Frame has no TTS audio (audio_url). Generate dialogue audio first.")
+            raise ValueError(
+                "Frame has no TTS audio (audio_url). Generate dialogue audio first."
+            )
 
-        video_task = next((t for t in script.video_tasks if t.id == video_task_id), None)
+        video_task = next(
+            (t for t in script.video_tasks if t.id == video_task_id), None
+        )
         if not video_task or not video_task.video_url:
-            raise ValueError(f"Video task {video_task_id} not found or has no video_url")
+            raise ValueError(
+                f"Video task {video_task_id} not found or has no video_url"
+            )
 
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
-            raise RuntimeError("FFmpeg is required for audio dubbing but was not found.")
+            raise RuntimeError(
+                "FFmpeg is required for audio dubbing but was not found."
+            )
 
         video_path = self._resolve_media_path(video_task.video_url, suffix=".mp4")
         tts_path = self._resolve_media_path(frame.audio_url, suffix=".mp3")
@@ -2659,7 +3423,9 @@ class ComicGenPipeline:
         if not tts_path or not os.path.exists(tts_path):
             raise ValueError(f"Audio file not found: {frame.audio_url}")
         if os.path.getsize(tts_path) < 1000:
-            raise ValueError("TTS audio file is invalid or empty. Please regenerate dialogue audio.")
+            raise ValueError(
+                "TTS audio file is invalid or empty. Please regenerate dialogue audio."
+            )
 
         # Delete old preview (lazy cleanup)
         if frame.preview_video_url:
@@ -2672,13 +3438,18 @@ class ComicGenPipeline:
 
         # frame.id comes from the store (== frame_id), keeping ffmpeg args taint-free.
         output_filename = f"preview_{frame.id}_{int(time.time())}.mp4"
-        output_path = _safe_resolve_path(os.path.join("output", "video"), output_filename)
+        output_path = _safe_resolve_path(
+            os.path.join("output", "video"), output_filename
+        )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         # Ensure background audio is cached (Demucs runs only on first call or video change)
-        bg_audio_path = self._ensure_bg_audio_cached(frame, video_path, video_task.video_url)
+        bg_audio_path = self._ensure_bg_audio_cached(
+            frame, video_path, video_task.video_url
+        )
 
         import tempfile
+
         work_dir = tempfile.mkdtemp(prefix="dub_mix_")
         try:
             if bg_audio_path:
@@ -2686,13 +3457,20 @@ class ComicGenPipeline:
                 delay_str = f"{offset_ms}|{offset_ms}"
 
                 mix_cmd = [
-                    ffmpeg_path, "-y",
-                    "-i", bg_audio_path,
-                    "-i", tts_path,
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    bg_audio_path,
+                    "-i",
+                    tts_path,
                     "-filter_complex",
                     f"[1:a]adelay={delay_str}[tts];[0:a][tts]amix=inputs=2:duration=first:weights=1 1[out]",
-                    "-map", "[out]",
-                    "-ac", "2", "-ar", "44100",
+                    "-map",
+                    "[out]",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
                     mixed_audio,
                 ]
 
@@ -2703,30 +3481,50 @@ class ComicGenPipeline:
                     raise RuntimeError("Audio mixing failed: output file not created")
 
                 mux_cmd = [
-                    ffmpeg_path, "-y",
-                    "-i", video_path,
-                    "-i", mixed_audio,
-                    "-map", "0:v",
-                    "-map", "1:a",
-                    "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    video_path,
+                    "-i",
+                    mixed_audio,
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "1:a",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-movflags",
+                    "+faststart",
                     output_path,
                 ]
                 subprocess.run(mux_cmd, check=True, capture_output=True, timeout=60)
             else:
                 delay_str = f"{offset_ms}|{offset_ms}"
                 cmd = [
-                    ffmpeg_path, "-y",
-                    "-i", video_path,
-                    "-i", tts_path,
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    video_path,
+                    "-i",
+                    tts_path,
                     "-filter_complex",
                     f"[1:a]adelay={delay_str}[tts];[tts]apad[out]",
-                    "-map", "0:v",
-                    "-map", "[out]",
-                    "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "[out]",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-movflags",
+                    "+faststart",
                     output_path,
                 ]
                 logger.info(f"[DUB] Simple replacement with adelay={offset_ms}ms")
@@ -2738,6 +3536,7 @@ class ComicGenPipeline:
             raise RuntimeError(f"Audio dubbing failed: {stderr_msg[:200]}")
         finally:
             import shutil
+
             shutil.rmtree(work_dir, ignore_errors=True)
 
         if not os.path.exists(output_path):
@@ -2814,9 +3613,9 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         logger.info(f"[MERGE] Starting video merge for script {script_id}")
-        
+
         # Check if ffmpeg is available (prioritize bundled version)
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
@@ -2828,62 +3627,88 @@ class ComicGenPipeline:
             )
             logger.error(f"[MERGE] FFmpeg not found. {error_msg}")
             raise RuntimeError(error_msg)
-        
+
         # Log ffmpeg version for debugging
         try:
             version_result = subprocess.run(
-                [ffmpeg_path, "-version"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5
             )
             if version_result.returncode == 0:
-                version_line = version_result.stdout.split('\n')[0] if version_result.stdout else "Unknown"
+                version_line = (
+                    version_result.stdout.split("\n")[0]
+                    if version_result.stdout
+                    else "Unknown"
+                )
                 logger.debug(f"[MERGE] Using FFmpeg: {version_line}")
                 logger.debug(f"[MERGE] FFmpeg path: {ffmpeg_path}")
             else:
-                logger.warning(f"[MERGE] Could not get FFmpeg version (exit code {version_result.returncode})")
+                logger.warning(
+                    f"[MERGE] Could not get FFmpeg version (exit code {version_result.returncode})"
+                )
         except Exception as e:
             logger.warning(f"[MERGE] Could not get FFmpeg version: {e}")
-            
+
         # Collect video paths
         video_paths = []
         for i, frame in enumerate(script.frames):
-            logger.info(f"[MERGE] Processing frame {i+1}/{len(script.frames)}: {frame.id}")
+            logger.info(
+                f"[MERGE] Processing frame {i + 1}/{len(script.frames)}: {frame.id}"
+            )
 
             # Prefer dubbed version (TTS audio already overlaid with lip-sync offset)
             if frame.dubbed_video_url:
                 dubbed_path = _safe_resolve_path("output", frame.dubbed_video_url)
                 if os.path.exists(dubbed_path):
-                    logger.debug(f"[MERGE]   -> Using dubbed video: {frame.dubbed_video_url}")
+                    logger.debug(
+                        f"[MERGE]   -> Using dubbed video: {frame.dubbed_video_url}"
+                    )
                     video_paths.append(frame.dubbed_video_url)
                     continue
                 else:
-                    logger.warning(f"[MERGE]   -> Dubbed video file missing: {dubbed_path}, falling back")
+                    logger.warning(
+                        f"[MERGE]   -> Dubbed video file missing: {dubbed_path}, falling back"
+                    )
 
             if not frame.selected_video_id:
                 # Try to find a default completed video
-                default_video = next((v for v in script.video_tasks if v.frame_id == frame.id and v.status == "completed"), None)
+                default_video = next(
+                    (
+                        v
+                        for v in script.video_tasks
+                        if v.frame_id == frame.id and v.status == "completed"
+                    ),
+                    None,
+                )
                 if default_video and default_video.video_url:
-                    logger.debug(f"[MERGE]   -> Using default video: {default_video.video_url}")
+                    logger.debug(
+                        f"[MERGE]   -> Using default video: {default_video.video_url}"
+                    )
                     video_paths.append(default_video.video_url)
                 else:
-                    logger.warning(f"[MERGE]   -> No video selected or available, skipping")
+                    logger.warning(
+                        f"[MERGE]   -> No video selected or available, skipping"
+                    )
                 continue
-                
-            video = next((v for v in script.video_tasks if v.id == frame.selected_video_id), None)
+
+            video = next(
+                (v for v in script.video_tasks if v.id == frame.selected_video_id), None
+            )
             if video and video.video_url:
                 logger.debug(f"[MERGE]   -> Selected video: {video.video_url}")
                 video_paths.append(video.video_url)
             else:
-                logger.warning(f"[MERGE]   -> Selected video {frame.selected_video_id} not found or has no URL")
-                
+                logger.warning(
+                    f"[MERGE]   -> Selected video {frame.selected_video_id} not found or has no URL"
+                )
+
         if not video_paths:
             logger.error("[MERGE] No videos found to merge!")
-            raise ValueError("No videos selected to merge. Please select videos for each frame first.")
-        
+            raise ValueError(
+                "No videos selected to merge. Please select videos for each frame first."
+            )
+
         logger.info(f"[MERGE] Found {len(video_paths)} videos to merge")
-            
+
         # Create file list for ffmpeg
         # script.id comes from the store (== script_id), keeping ffmpeg args taint-free.
         list_path = _safe_resolve_path("output", f"merge_list_{script.id}.txt")
@@ -2900,53 +3725,73 @@ class ComicGenPipeline:
                         logger.debug(f"[MERGE] Added to list: {abs_path}")
                     else:
                         logger.warning(f"[MERGE] Video file not found: {abs_path}")
-                        
+
         if not abs_video_paths:
             logger.error("[MERGE] No valid video files found on disk!")
-            raise ValueError("No valid video files found. The video files may have been deleted or moved.")
-        
+            raise ValueError(
+                "No valid video files found. The video files may have been deleted or moved."
+            )
+
         logger.info(f"[MERGE] Merge list created with {len(abs_video_paths)} videos")
 
         # Output path
         output_filename = f"merged_{script.id}_{int(time.time())}.mp4"
-        output_path = _safe_resolve_path(os.path.join("output", "video"), output_filename)
+        output_path = _safe_resolve_path(
+            os.path.join("output", "video"), output_filename
+        )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
+
         logger.debug(f"[MERGE] Output path: {output_path}")
-        
+
         # Log video file details for debugging
         for i, path in enumerate(abs_video_paths):
             try:
                 size_mb = os.path.getsize(path) / (1024 * 1024)
-                logger.debug(f"[MERGE] Input video {i+1}: {os.path.basename(path)} ({size_mb:.2f} MB)")
+                logger.debug(
+                    f"[MERGE] Input video {i + 1}: {os.path.basename(path)} ({size_mb:.2f} MB)"
+                )
             except Exception as e:
-                logger.warning(f"[MERGE] Could not get size for video {i+1}: {e}")
-        
+                logger.warning(f"[MERGE] Could not get size for video {i + 1}: {e}")
+
         # Run ffmpeg
         # Use re-encoding for better compatibility (slower but more reliable)
         # -c:v libx264 -c:a aac ensures consistent output format
         cmd = [
-            ffmpeg_path, "-y",  # Use the detected ffmpeg path
-            "-f", "concat",
-            "-safe", "0",
-            "-i", list_path,
-            "-c:v", "libx264",  # Re-encode video with H.264
-            "-crf", "23",       # Quality (lower = better, 23 is default)
-            "-preset", "fast",  # Encoding speed
-            "-c:a", "aac",      # Re-encode audio with AAC
-            "-b:a", "128k",     # Audio bitrate
-            "-movflags", "+faststart",  # Web optimization
-            output_path
+            ffmpeg_path,
+            "-y",  # Use the detected ffmpeg path
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_path,
+            "-c:v",
+            "libx264",  # Re-encode video with H.264
+            "-crf",
+            "23",  # Quality (lower = better, 23 is default)
+            "-preset",
+            "fast",  # Encoding speed
+            "-c:a",
+            "aac",  # Re-encode audio with AAC
+            "-b:a",
+            "128k",  # Audio bitrate
+            "-movflags",
+            "+faststart",  # Web optimization
+            output_path,
         ]
-        
+
         logger.debug(f"[MERGE] Running FFmpeg command: {' '.join(cmd)}")
         logger.debug(f"[MERGE] Platform: {platform.system()} {platform.release()}")
-        
+
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, timeout=600)  # 10 min timeout for re-encoding
-            logger.debug(f"[MERGE] FFmpeg stdout: {result.stdout.decode()[:500] if result.stdout else 'empty'}")
+            result = subprocess.run(
+                cmd, check=True, capture_output=True, timeout=600
+            )  # 10 min timeout for re-encoding
+            logger.debug(
+                f"[MERGE] FFmpeg stdout: {result.stdout.decode()[:500] if result.stdout else 'empty'}"
+            )
             logger.info(f"[MERGE] FFmpeg completed successfully")
-            
+
             # Update script with merged video path
             # Use 'videos/' (plural) to match the /files/videos route
             script.merged_video_url = f"videos/{output_filename}"
@@ -2954,11 +3799,19 @@ class ComicGenPipeline:
             # Verify file was created and log details
             if os.path.exists(output_path):
                 file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                logger.info(f"[MERGE] ✅ Merged video created successfully: {output_filename} ({file_size_mb:.2f} MB)")
-                logger.info(f"[MERGE] ✅ Video accessible at: /files/videos/{output_filename}")
+                logger.info(
+                    f"[MERGE] ✅ Merged video created successfully: {output_filename} ({file_size_mb:.2f} MB)"
+                )
+                logger.info(
+                    f"[MERGE] ✅ Video accessible at: /files/videos/{output_filename}"
+                )
             else:
-                logger.error(f"[MERGE] ❌ Merged video file NOT found at: {output_path}")
-                raise RuntimeError(f"Video merge completed but output file not found: {output_path}")
+                logger.error(
+                    f"[MERGE] ❌ Merged video file NOT found at: {output_path}"
+                )
+                raise RuntimeError(
+                    f"Video merge completed but output file not found: {output_path}"
+                )
 
             # PR-3l · Pass 2: BGM mux. If script.bgm_url is set and the BGM
             # file exists, overlay it under the existing audio track at the
@@ -2967,12 +3820,16 @@ class ComicGenPipeline:
             # a future enhancement can swap to per-frame dialogue overlay.
             try:
                 mixed_path = self._maybe_apply_bgm_mux(
-                    script, output_path, ffmpeg_path,
+                    script,
+                    output_path,
+                    ffmpeg_path,
                 )
                 if mixed_path:
                     # Replace the concat output with the mixed one (same filename)
                     os.replace(mixed_path, output_path)
-                    logger.info(f"[MERGE] ✅ BGM mux applied — final file: {output_filename}")
+                    logger.info(
+                        f"[MERGE] ✅ BGM mux applied — final file: {output_filename}"
+                    )
             except Exception as bgm_err:
                 # BGM is optional; log + carry on with the silent video
                 logger.warning(f"[MERGE] BGM mux skipped due to error: {bgm_err}")
@@ -2990,18 +3847,20 @@ class ComicGenPipeline:
         except subprocess.CalledProcessError as e:
             stderr_msg = e.stderr.decode() if e.stderr else "No error output"
             stdout_msg = e.stdout.decode() if e.stdout else "No output"
-            
+
             # Log full details for debugging
             logger.error(f"[MERGE] FFmpeg failed with exit code {e.returncode}")
             logger.error(f"[MERGE] FFmpeg command: {' '.join(cmd)}")
             logger.error(f"[MERGE] FFmpeg stderr: {stderr_msg}")
             logger.error(f"[MERGE] FFmpeg stdout: {stdout_msg}")
-            logger.error(f"[MERGE] Video files attempted: {[os.path.basename(p) for p in abs_video_paths]}")
-            
+            logger.error(
+                f"[MERGE] Video files attempted: {[os.path.basename(p) for p in abs_video_paths]}"
+            )
+
             # Extract user-friendly error message
             user_msg = self._extract_ffmpeg_error_message(stderr_msg, abs_video_paths)
             raise RuntimeError(user_msg)
-    
+
     def _maybe_apply_bgm_mux(
         self,
         script: Script,
@@ -3037,18 +3896,34 @@ class ComicGenPipeline:
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
         cmd = [
-            ffmpeg_path, "-y",
-            "-i", video_path,
-            "-stream_loop", "-1", "-i", bgm_abs,
-            "-filter_complex", filter_complex,
-            "-map", "0:v", "-map", "[aout]",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
+            ffmpeg_path,
+            "-y",
+            "-i",
+            video_path,
+            "-stream_loop",
+            "-1",
+            "-i",
+            bgm_abs,
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
             "-shortest",
-            "-movflags", "+faststart",
+            "-movflags",
+            "+faststart",
             mixed_path,
         ]
-        logger.info(f"[MERGE/BGM] muxing BGM dial={dial:.2f} bgm={bgm_lvl:.2f} — {os.path.basename(bgm_abs)}")
+        logger.info(
+            f"[MERGE/BGM] muxing BGM dial={dial:.2f} bgm={bgm_lvl:.2f} — {os.path.basename(bgm_abs)}"
+        )
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=300)
         except subprocess.CalledProcessError as e:
@@ -3063,19 +3938,21 @@ class ComicGenPipeline:
     def _extract_ffmpeg_error_message(self, stderr: str, video_paths: List[str]) -> str:
         """
         Extract a user-friendly error message from ffmpeg stderr output.
-        
+
         Args:
             stderr: The stderr output from ffmpeg
             video_paths: List of video file paths that were being processed
-            
+
         Returns:
             A user-friendly error message
         """
         if not stderr:
-            return "FFmpeg merge failed with no error output. Please check the log files."
-        
+            return (
+                "FFmpeg merge failed with no error output. Please check the log files."
+            )
+
         stderr_lower = stderr.lower()
-        
+
         # Common error patterns with user-friendly messages
         if "no such file or directory" in stderr_lower:
             return (
@@ -3083,129 +3960,157 @@ class ComicGenPipeline:
                 "The videos may have been deleted or moved.\n"
                 "Please try regenerating the missing videos."
             )
-        
-        if "invalid data found" in stderr_lower or "invalid file" in stderr_lower or "moov atom not found" in stderr_lower:
+
+        if (
+            "invalid data found" in stderr_lower
+            or "invalid file" in stderr_lower
+            or "moov atom not found" in stderr_lower
+        ):
             return (
                 "One or more video files are corrupted or incomplete.\n"
                 "This can happen if video generation was interrupted.\n"
                 "Please try regenerating the affected videos."
             )
-        
-        if ("codec" in stderr_lower and ("not supported" in stderr_lower or "unknown" in stderr_lower)):
+
+        if "codec" in stderr_lower and (
+            "not supported" in stderr_lower or "unknown" in stderr_lower
+        ):
             return (
                 "Video codec compatibility issue detected.\n"
                 "The video format may not be supported by your FFmpeg installation.\n"
                 "Try updating FFmpeg to the latest version."
             )
-        
+
         if "permission denied" in stderr_lower or "access is denied" in stderr_lower:
             return (
                 "Permission denied when accessing video files.\n"
                 "Please check that the application has read/write permissions\n"
                 "for the output directory."
             )
-        
+
         if "disk full" in stderr_lower or "no space" in stderr_lower:
             return (
                 "Insufficient disk space to create the merged video.\n"
                 "Please free up some space and try again."
             )
-        
-        if "height not divisible" in stderr_lower or "width not divisible" in stderr_lower:
+
+        if (
+            "height not divisible" in stderr_lower
+            or "width not divisible" in stderr_lower
+        ):
             return (
                 "Video resolution compatibility issue.\n"
                 "The videos have incompatible dimensions.\n"
                 "This should not happen - please report this issue."
             )
-        
+
         if "invalid argument" in stderr_lower:
             # Check if it's related to file list
-            if any("filelist" in line.lower() or "concat" in line.lower() for line in stderr.split('\n')):
+            if any(
+                "filelist" in line.lower() or "concat" in line.lower()
+                for line in stderr.split("\n")
+            ):
                 return (
                     "FFmpeg could not read the video file list.\n"
                     "This might be a file path encoding issue.\n"
                     "Please ensure video filenames don't contain special characters."
                 )
-        
+
         # Fallback: extract the most relevant error line
         # Usually the last non-empty line before the final summary
-        error_lines = [line.strip() for line in stderr.split('\n') if line.strip()]
+        error_lines = [line.strip() for line in stderr.split("\n") if line.strip()]
         if error_lines:
             # Look for lines that seem like actual errors (contain "error", "failed", etc.)
             for line in reversed(error_lines):
                 line_lower = line.lower()
-                if any(keyword in line_lower for keyword in ['error', 'failed', 'invalid', 'cannot', 'unable']):
+                if any(
+                    keyword in line_lower
+                    for keyword in ["error", "failed", "invalid", "cannot", "unable"]
+                ):
                     # Truncate if too long
                     if len(line) > 200:
                         line = line[:200] + "..."
                     return f"FFmpeg error: {line}\n\nPlease check the application logs for more details."
-            
+
             # If no error keyword found, use last line
             last_line = error_lines[-1]
             if len(last_line) > 200:
                 last_line = last_line[:200] + "..."
             return f"FFmpeg merge failed: {last_line}\n\nPlease check the application logs for more details."
-        
+
         return "FFmpeg merge failed with unknown error. Please check the application logs for details."
 
-    def create_asset_video_task(self, script_id: str, asset_id: str, asset_type: str, prompt: str, duration: int = 5, aspect_ratio: str = None) -> Tuple[Script, str]:
+    def create_asset_video_task(
+        self,
+        script_id: str,
+        asset_id: str,
+        asset_type: str,
+        prompt: str,
+        duration: int = 5,
+        aspect_ratio: str = None,
+    ) -> Tuple[Script, str]:
         """Creates a new video generation task for an asset (R2V)."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         # Find asset
         target_asset = None
         if asset_type == "character":
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
         elif asset_type == "scene":
             target_asset = next((s for s in script.scenes if s.id == asset_id), None)
         elif asset_type == "prop":
             target_asset = next((p for p in script.props if p.id == asset_id), None)
-            
+
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
-            
+
         # Use main image as reference
         image_url = target_asset.image_url
         if not image_url:
-             # Try fallback for character
-             if asset_type == "character":
-                 image_url = target_asset.full_body_image_url or target_asset.avatar_url
-        
+            # Try fallback for character
+            if asset_type == "character":
+                image_url = target_asset.full_body_image_url or target_asset.avatar_url
+
         if not image_url:
             raise ValueError("Asset has no reference image")
 
         # Save prompt to asset
         if prompt:
             target_asset.video_prompt = prompt
-            
+
         task_id = str(uuid.uuid4())
-        
+
         # Create VideoTask
         task = VideoTask(
             id=task_id,
             project_id=script_id,
-            asset_id=asset_id, # Link to asset
+            asset_id=asset_id,  # Link to asset
             image_url=image_url,
             prompt=prompt or f"Cinematic shot of {target_asset.name}",
             status="pending",
             duration=duration,
-            model=script.model_settings.r2v_model if hasattr(script.model_settings, 'r2v_model') and script.model_settings.r2v_model else "wan2.7-r2v",
+            model=script.model_settings.r2v_model
+            if hasattr(script.model_settings, "r2v_model")
+            and script.model_settings.r2v_model
+            else "wan2.7-r2v",
             generation_mode="r2v",
-            created_at=time.time()
+            created_at=time.time(),
         )
-        
+
         # Add to script.video_tasks for global tracking
         if not script.video_tasks:
             script.video_tasks = []
         script.video_tasks.append(task)
-        
+
         # Add to asset's video_assets list
         if not target_asset.video_assets:
             target_asset.video_assets = []
         target_asset.video_assets.append(task)
-        
+
         self._save_data()
         return script, task_id
 
@@ -3215,40 +4120,67 @@ class ComicGenPipeline:
         if not script:
             logger.error(f"Script {script_id} not found for task {task_id}")
             return
-            
+
         task = next((t for t in script.video_tasks if t.id == task_id), None)
-        
+
         if not task:
             logger.error(f"Task {task_id} not found in script {script_id}")
             return
 
+        self.task_manager.register(
+            task_id,
+            kind="video",
+            title=f"视频生成 · {getattr(script, 'title', script_id)}",
+            project_id=script_id,
+            series_id=getattr(script, "series_id", None),
+            asset_id=task.asset_id,
+            frame_id=getattr(task, "frame_id", None),
+        )
+
         try:
+            self.task_manager.checkpoint(task_id)
             # Update status to processing
             task.status = "processing"
+
+            # Video models understand English best; translate once and cache.
+            gen_prompt = task.prompt
+            try:
+                if not getattr(task, "prompt_en", None) and any(
+                    "\u4e00" <= ch <= "\u9fff" for ch in (task.prompt or "")
+                ):
+                    from .prompt_translate import to_english_prompt
+
+                    task.prompt_en = to_english_prompt(task.prompt) or None
+                if getattr(task, "prompt_en", None):
+                    gen_prompt = task.prompt_en
+            except Exception:
+                pass
             self._save_data()
-            
+
             # Download image to temp file
             img_path = None
             if task.image_url:
                 img_path = self._download_temp_image(task.image_url)
-            
+
+            self.task_manager.checkpoint(task_id)
+
             # Generate video
             output_filename = f"video_{task_id}.mp4"
             output_path = os.path.join("output", "video", output_filename)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
+
             # Handle Audio Logic
             # 1. Silent: audio_url=None, audio=False
             # 2. AI Sound: audio_url=None, audio=True
             # 3. Sound Driven: audio_url=URL (audio param ignored)
-            
+
             final_audio_url = None
             final_generate_audio = False
-            
+
             if task.audio_url:
                 # Sound Driven Mode
                 final_audio_url = task.audio_url
-                final_generate_audio = False # API says audio param ignored if url present, but let's be explicit
+                final_generate_audio = False  # API says audio param ignored if url present, but let's be explicit
             elif task.generate_audio:
                 # AI Sound Mode
                 final_audio_url = None
@@ -3266,7 +4198,8 @@ class ComicGenPipeline:
             model_name_lower = model_name.lower()
             backend = self._resolve_video_backend(model_name)
             use_vendor_kling = backend == "vendor" and (
-                model_name_lower.startswith("kling-") or model_name_lower.startswith("kling/kling-")
+                model_name_lower.startswith("kling-")
+                or model_name_lower.startswith("kling/kling-")
             )
             use_vendor_vidu = backend == "vendor" and (
                 model_name_lower.startswith("vidu")
@@ -3281,9 +4214,10 @@ class ComicGenPipeline:
             if use_mulerouter:
                 if self._mulerouter_video_model is None:
                     from ...models.mulerouter import MuleRouterVideoModel
+
                     self._mulerouter_video_model = MuleRouterVideoModel({})
                 video_path, _ = self._mulerouter_video_model.generate(
-                    prompt=task.prompt,
+                    prompt=gen_prompt,
                     output_path=output_path,
                     img_url=img_url,
                     img_path=img_path,
@@ -3291,17 +4225,22 @@ class ComicGenPipeline:
                     resolution=task.resolution,
                     aspect_ratio=task.ratio or "16:9",
                     seed=task.seed,
-                    watermark=bool(task.watermark) if task.watermark is not None else False,
+                    watermark=bool(task.watermark)
+                    if task.watermark is not None
+                    else False,
                     generation_mode=task.generation_mode,
-                    ref_image_urls=task.reference_image_urls if task.generation_mode == "r2v" else None,
+                    ref_image_urls=task.reference_image_urls
+                    if task.generation_mode == "r2v"
+                    else None,
                 )
             elif use_vendor_kling:
                 # Use Kling model (cached)
                 if self._kling_model is None:
                     from ...models.kling import KlingModel
+
                     self._kling_model = KlingModel({})
                 video_path, _ = self._kling_model.generate(
-                    prompt=task.prompt,
+                    prompt=gen_prompt,
                     output_path=output_path,
                     img_url=img_url,
                     img_path=img_path,
@@ -3317,9 +4256,10 @@ class ComicGenPipeline:
                 # Use Vidu model (cached)
                 if self._vidu_model is None:
                     from ...models.vidu import ViduModel
+
                     self._vidu_model = ViduModel({})
                 video_path, _ = self._vidu_model.generate(
-                    prompt=task.prompt,
+                    prompt=gen_prompt,
                     output_path=output_path,
                     img_url=img_url,
                     img_path=img_path,
@@ -3337,16 +4277,21 @@ class ComicGenPipeline:
                 # request_id) onto our VideoTask the moment wanx gets them, BEFORE
                 # the long polling loop. Lets the user copy them from the queue
                 # panel even mid-generation if the task hangs.
-                def _capture_provider_ids(provider_name: str, ptask_id: Optional[str], preq_id: Optional[str]) -> None:
+                def _capture_provider_ids(
+                    provider_name: str, ptask_id: Optional[str], preq_id: Optional[str]
+                ) -> None:
                     task.provider_name = provider_name
                     task.provider_task_id = ptask_id
                     task.provider_request_id = preq_id
                     try:
                         self._save_data()
                     except Exception:
-                        logger.warning("Failed to persist provider IDs mid-flight; will retry at task completion")
+                        logger.warning(
+                            "Failed to persist provider IDs mid-flight; will retry at task completion"
+                        )
+
                 video_path, _ = self.video_generator.model.generate(
-                    prompt=task.prompt,
+                    prompt=gen_prompt,
                     output_path=output_path,
                     img_path=img_path,
                     img_url=img_url,
@@ -3360,33 +4305,50 @@ class ComicGenPipeline:
                     negative_prompt=task.negative_prompt,
                     model=task.model,
                     shot_type=task.shot_type,
-                    ref_video_urls=task.reference_video_urls if task.generation_mode == "r2v" else None,
-                    ref_image_urls=task.reference_image_urls if task.generation_mode == "r2v" else None,
+                    ref_video_urls=task.reference_video_urls
+                    if task.generation_mode == "r2v"
+                    else None,
+                    ref_image_urls=task.reference_image_urls
+                    if task.generation_mode == "r2v"
+                    else None,
                     ratio=task.ratio,
                     # Pass watermark explicitly; wanx.generate's default is False so
                     # None becomes False, matching "leave to provider default = off".
-                    watermark=bool(task.watermark) if task.watermark is not None else False,
+                    watermark=bool(task.watermark)
+                    if task.watermark is not None
+                    else False,
                     audio_setting=task.audio_setting,
                     camera_motion=None,
                     subject_motion=None,
                     on_provider_ids=_capture_provider_ids,
                 )
-            
+
             task.video_url = os.path.relpath(output_path, "output")
+            self.task_manager.checkpoint(task_id)
             task.status = "completed"
-            
+
             # Sync with asset if this is an asset video
             if task.asset_id:
                 self._sync_asset_video_task(script, task)
-            
+            self.task_manager.finish(task_id, "completed")
+
+        except TaskStopped:
+            logger.info(f"Video task {task_id} canceled by user")
+            task.status = "failed"
+            task.error = "Canceled by user"
+            if task.asset_id:
+                self._sync_asset_video_task(script, task)
+            self.task_manager.finish(task_id, "canceled", error="Canceled by user")
         except Exception as e:
             import traceback
+
             logger.exception("Failed to process video task")
             logger.error(f"Video generation failed: {e}")
             task.status = "failed"
             if task.asset_id:
                 self._sync_asset_video_task(script, task)
-            
+            self.task_manager.finish(task_id, "failed", error=str(e))
+
         self._save_data()
 
     def _sync_asset_video_task(self, script: Script, task: VideoTask):
@@ -3407,7 +4369,7 @@ class ComicGenPipeline:
                 if prop.id == task.asset_id:
                     target_asset = prop
                     break
-        
+
         if target_asset:
             # Find and update the task in the asset's list
             for i, t in enumerate(target_asset.video_assets):
@@ -3418,42 +4380,53 @@ class ComicGenPipeline:
                 # Not found, append it (shouldn't happen if created correctly, but good fallback)
                 target_asset.video_assets.append(task)
 
-    def delete_asset_video(self, script_id: str, asset_id: str, asset_type: str, video_id: str) -> Script:
+    def delete_asset_video(
+        self, script_id: str, asset_id: str, asset_type: str, video_id: str
+    ) -> Script:
         """Deletes a video from an asset."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         # Find asset
         target_asset = None
         if asset_type == "character":
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
         elif asset_type == "scene":
             target_asset = next((s for s in script.scenes if s.id == asset_id), None)
         elif asset_type == "prop":
             target_asset = next((p for p in script.props if p.id == asset_id), None)
-        
+
         if not target_asset:
             raise ValueError(f"Asset {asset_id} of type {asset_type} not found")
-        
+
         # Find the task first to get video_url for file deletion
         video_task_to_delete = None
         if script.video_tasks:
-            video_task_to_delete = next((v for v in script.video_tasks if v.id == video_id), None)
-        
+            video_task_to_delete = next(
+                (v for v in script.video_tasks if v.id == video_id), None
+            )
+
         # Remove from asset's video_assets
         if target_asset.video_assets:
             original_len = len(target_asset.video_assets)
-            target_asset.video_assets = [v for v in target_asset.video_assets if v.id != video_id]
-            if len(target_asset.video_assets) == original_len and not video_task_to_delete:
-                 # Only raise if not found in either place, or just log warning?
-                 # If found in global list but not asset list, it's weird but we should proceed.
-                 pass
+            target_asset.video_assets = [
+                v for v in target_asset.video_assets if v.id != video_id
+            ]
+            if (
+                len(target_asset.video_assets) == original_len
+                and not video_task_to_delete
+            ):
+                # Only raise if not found in either place, or just log warning?
+                # If found in global list but not asset list, it's weird but we should proceed.
+                pass
 
         # Also remove from script.video_tasks
         if script.video_tasks:
             script.video_tasks = [v for v in script.video_tasks if v.id != video_id]
-        
+
         # Try to delete the video file
         try:
             if video_task_to_delete and video_task_to_delete.video_url:
@@ -3463,7 +4436,7 @@ class ComicGenPipeline:
                     logger.info(f"Deleted video file: {video_path}")
         except Exception as e:
             logger.warning(f"Failed to delete video file: {e}")
-        
+
         self._save_data()
         return script
 
@@ -3472,36 +4445,44 @@ class ComicGenPipeline:
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         logger.info(f"Generating audio for script {script.id}")
-        
+
         for frame in script.frames:
             # Generate Dialogue
             if frame.dialogue:
                 speaker = None
                 if frame.character_ids:
-                    speaker = next((c for c in script.characters if c.id == frame.character_ids[0]), None)
-                
+                    speaker = next(
+                        (
+                            c
+                            for c in script.characters
+                            if c.id == frame.character_ids[0]
+                        ),
+                        None,
+                    )
+
                 if speaker:
                     self.audio_generator.generate_dialogue(
-                        frame, speaker,
+                        frame,
+                        speaker,
                         speed=speaker.voice_speed,
                         pitch=speaker.voice_pitch,
-                        volume=speaker.voice_volume
+                        volume=speaker.voice_volume,
                     )
-            
+
             # Generate SFX (Text-to-Audio)
             if frame.action_description:
                 self.audio_generator.generate_sfx(frame)
-                
+
             # Generate SFX (Video-to-Audio) - if video exists
             if frame.video_url:
                 self.audio_generator.generate_sfx_from_video(frame)
-                
+
             # Generate BGM
             # Simple logic: generate BGM for every frame (or scene start)
             self.audio_generator.generate_bgm(frame)
-                
+
         self._save_data()
         return script
 
@@ -3529,22 +4510,28 @@ class ComicGenPipeline:
             raise ValueError("Frame not found")
 
         dialogue_text = (
-            (frame.dialogue_structured.line if frame.dialogue_structured else None)
-            or frame.dialogue
-        )
+            frame.dialogue_structured.line if frame.dialogue_structured else None
+        ) or frame.dialogue
         if dialogue_text:
             speaker = None
             if frame.character_ids:
-                speaker = next((c for c in script.characters if c.id == frame.character_ids[0]), None)
+                speaker = next(
+                    (c for c in script.characters if c.id == frame.character_ids[0]),
+                    None,
+                )
             speaker_name = frame.speaker or (
                 frame.dialogue_structured.speaker if frame.dialogue_structured else None
             )
             if not speaker and speaker_name:
                 key = speaker_name.strip().lower()
                 speaker = next(
-                    (c for c in script.characters if c.name.strip().lower() == key
-                     or key in c.name.strip().lower()
-                     or c.name.strip().lower() in key),
+                    (
+                        c
+                        for c in script.characters
+                        if c.name.strip().lower() == key
+                        or key in c.name.strip().lower()
+                        or c.name.strip().lower() in key
+                    ),
                     None,
                 )
 
@@ -3557,7 +4544,11 @@ class ComicGenPipeline:
                         model_override = custom.target_model
                         family_override = custom.family
                 self.audio_generator.generate_dialogue(
-                    frame, speaker, speed, pitch, volume,
+                    frame,
+                    speaker,
+                    speed,
+                    pitch,
+                    volume,
                     instructions=instructions,
                     model_override=model_override,
                     family_override=family_override,
@@ -3566,16 +4557,18 @@ class ComicGenPipeline:
         self._save_data()
         return script
 
-    def bind_voice(self, script_id: str, char_id: str, voice_id: str, voice_name: str) -> Script:
+    def bind_voice(
+        self, script_id: str, char_id: str, voice_id: str, voice_name: str
+    ) -> Script:
         """Binds a voice to a character."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         char = next((c for c in script.characters if c.id == char_id), None)
         if not char:
             raise ValueError("Character not found")
-            
+
         char.voice_id = voice_id
         char.voice_name = voice_name
         self._save_data()
@@ -3588,7 +4581,7 @@ class ComicGenPipeline:
         """Helper to select a variant in an ImageAsset. Returns the selected variant if found."""
         if not image_asset or not image_asset.variants:
             return None
-            
+
         for variant in image_asset.variants:
             if variant.id == variant_id:
                 image_asset.selected_id = variant_id
@@ -3599,10 +4592,10 @@ class ComicGenPipeline:
         """Helper to delete a variant in an ImageAsset. Returns True if found and deleted."""
         if not image_asset or not image_asset.variants:
             return False
-            
+
         initial_len = len(image_asset.variants)
         image_asset.variants = [v for v in image_asset.variants if v.id != variant_id]
-        
+
         if len(image_asset.variants) < initial_len:
             # If we deleted the selected one, select the last one or None
             if image_asset.selected_id == variant_id:
@@ -3613,36 +4606,53 @@ class ComicGenPipeline:
             return True
         return False
 
-    def select_asset_variant(self, script_id: str, asset_id: str, asset_type: str, variant_id: str, generation_type: str = None) -> Script:
+    def select_asset_variant(
+        self,
+        script_id: str,
+        asset_id: str,
+        asset_type: str,
+        variant_id: str,
+        generation_type: str = None,
+    ) -> Script:
         """Selects a specific variant for an asset."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         target_asset = None
         asset_is_series_level = False
         if asset_type == "character":
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
             # Fallback to parent series for series-level characters.
             if not target_asset and script.series_id:
                 series = self.series_store.get(script.series_id)
                 if series:
-                    target_asset = next((c for c in series.characters if c.id == asset_id), None)
+                    target_asset = next(
+                        (c for c in series.characters if c.id == asset_id), None
+                    )
                     if target_asset:
                         asset_is_series_level = True
             if target_asset:
                 # If generation_type is specified, only select from that specific asset
                 if generation_type == "full_body":
-                    variant = self._select_variant_in_asset(target_asset.full_body_asset, variant_id)
+                    variant = self._select_variant_in_asset(
+                        target_asset.full_body_asset, variant_id
+                    )
                     if variant:
                         target_asset.full_body_image_url = variant.url
                         target_asset.image_url = variant.url  # Legacy sync
                 elif generation_type == "three_view":
-                    variant = self._select_variant_in_asset(target_asset.three_view_asset, variant_id)
+                    variant = self._select_variant_in_asset(
+                        target_asset.three_view_asset, variant_id
+                    )
                     if variant:
                         target_asset.three_view_image_url = variant.url
                 elif generation_type == "headshot":
-                    variant = self._select_variant_in_asset(target_asset.headshot_asset, variant_id)
+                    variant = self._select_variant_in_asset(
+                        target_asset.headshot_asset, variant_id
+                    )
                     if variant:
                         target_asset.headshot_image_url = variant.url
                         target_asset.avatar_url = variant.url  # Sync avatar
@@ -3651,39 +4661,51 @@ class ComicGenPipeline:
                     # the CastWorkbench flow. Selecting a variant here updates
                     # selected_image_id + legacy image_url so the rest of the
                     # app (storyboard reference, etc.) sees the pick.
-                    variant = self._select_variant_in_asset(getattr(target_asset, "reference_sheet", None), variant_id)
+                    variant = self._select_variant_in_asset(
+                        getattr(target_asset, "reference_sheet", None), variant_id
+                    )
                     if variant:
                         if target_asset.reference_sheet:
                             target_asset.reference_sheet.selected_image_id = variant.id
                         target_asset.image_url = variant.url
                 else:
                     # Legacy fallback: search all assets (for backward compatibility)
-                    variant = self._select_variant_in_asset(target_asset.full_body_asset, variant_id)
+                    variant = self._select_variant_in_asset(
+                        target_asset.full_body_asset, variant_id
+                    )
                     if variant:
                         target_asset.full_body_image_url = variant.url
                         target_asset.image_url = variant.url
 
                     if not variant:
-                        variant = self._select_variant_in_asset(target_asset.three_view_asset, variant_id)
+                        variant = self._select_variant_in_asset(
+                            target_asset.three_view_asset, variant_id
+                        )
                         if variant:
                             target_asset.three_view_image_url = variant.url
 
                     if not variant:
-                        variant = self._select_variant_in_asset(target_asset.headshot_asset, variant_id)
+                        variant = self._select_variant_in_asset(
+                            target_asset.headshot_asset, variant_id
+                        )
                         if variant:
                             target_asset.headshot_image_url = variant.url
                             target_asset.avatar_url = variant.url
-                        
+
         elif asset_type == "scene":
             target_asset = next((s for s in script.scenes if s.id == asset_id), None)
             if not target_asset and script.series_id:
                 series = self.series_store.get(script.series_id)
                 if series:
-                    target_asset = next((s for s in series.scenes if s.id == asset_id), None)
+                    target_asset = next(
+                        (s for s in series.scenes if s.id == asset_id), None
+                    )
                     if target_asset:
                         asset_is_series_level = True
             if target_asset:
-                variant = self._select_variant_in_asset(target_asset.image_asset, variant_id)
+                variant = self._select_variant_in_asset(
+                    target_asset.image_asset, variant_id
+                )
                 if variant:
                     target_asset.image_url = variant.url
 
@@ -3692,11 +4714,15 @@ class ComicGenPipeline:
             if not target_asset and script.series_id:
                 series = self.series_store.get(script.series_id)
                 if series:
-                    target_asset = next((p for p in series.props if p.id == asset_id), None)
+                    target_asset = next(
+                        (p for p in series.props if p.id == asset_id), None
+                    )
                     if target_asset:
                         asset_is_series_level = True
             if target_asset:
-                variant = self._select_variant_in_asset(target_asset.image_asset, variant_id)
+                variant = self._select_variant_in_asset(
+                    target_asset.image_asset, variant_id
+                )
                 if variant:
                     target_asset.image_url = variant.url
 
@@ -3704,14 +4730,18 @@ class ComicGenPipeline:
             target_asset = next((f for f in script.frames if f.id == asset_id), None)
             if target_asset:
                 # Check rendered_image_asset
-                variant = self._select_variant_in_asset(target_asset.rendered_image_asset, variant_id)
+                variant = self._select_variant_in_asset(
+                    target_asset.rendered_image_asset, variant_id
+                )
                 if variant:
                     target_asset.rendered_image_url = variant.url
-                    target_asset.image_url = variant.url # Main image is rendered one
-                
+                    target_asset.image_url = variant.url  # Main image is rendered one
+
                 # Also check image_asset (sketch)?
                 if not variant:
-                    variant = self._select_variant_in_asset(target_asset.image_asset, variant_id)
+                    variant = self._select_variant_in_asset(
+                        target_asset.image_asset, variant_id
+                    )
                     # If sketch, maybe don't update main image_url if rendered exists?
                     # For now, let's assume we only select rendered variants for frames usually.
 
@@ -3720,52 +4750,105 @@ class ComicGenPipeline:
             self._save_series_data()
         return script
 
-    def delete_asset_variant(self, script_id: str, asset_id: str, asset_type: str, variant_id: str) -> Script:
+    def delete_asset_variant(
+        self, script_id: str, asset_id: str, asset_type: str, variant_id: str
+    ) -> Script:
         """Deletes a specific variant from an asset."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-            
+
         target_asset = None
         if asset_type == "character":
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
             if target_asset:
-                if self._delete_variant_in_asset(target_asset.full_body_asset, variant_id):
+                if self._delete_variant_in_asset(
+                    target_asset.full_body_asset, variant_id
+                ):
                     # Sync legacy if needed
                     if target_asset.full_body_asset.selected_id:
-                        selected = next((v for v in target_asset.full_body_asset.variants if v.id == target_asset.full_body_asset.selected_id), None)
+                        selected = next(
+                            (
+                                v
+                                for v in target_asset.full_body_asset.variants
+                                if v.id == target_asset.full_body_asset.selected_id
+                            ),
+                            None,
+                        )
                         target_asset.image_url = selected.url if selected else None
                     else:
                         target_asset.image_url = None
-                
-                elif self._delete_variant_in_asset(target_asset.three_view_asset, variant_id):
+
+                elif self._delete_variant_in_asset(
+                    target_asset.three_view_asset, variant_id
+                ):
                     if target_asset.three_view_asset.selected_id:
-                        selected = next((v for v in target_asset.three_view_asset.variants if v.id == target_asset.three_view_asset.selected_id), None)
-                        target_asset.three_view_image_url = selected.url if selected else None
+                        selected = next(
+                            (
+                                v
+                                for v in target_asset.three_view_asset.variants
+                                if v.id == target_asset.three_view_asset.selected_id
+                            ),
+                            None,
+                        )
+                        target_asset.three_view_image_url = (
+                            selected.url if selected else None
+                        )
                     else:
                         target_asset.three_view_image_url = None
 
-                elif self._delete_variant_in_asset(target_asset.headshot_asset, variant_id):
+                elif self._delete_variant_in_asset(
+                    target_asset.headshot_asset, variant_id
+                ):
                     if target_asset.headshot_asset.selected_id:
-                        selected = next((v for v in target_asset.headshot_asset.variants if v.id == target_asset.headshot_asset.selected_id), None)
-                        target_asset.headshot_image_url = selected.url if selected else None
+                        selected = next(
+                            (
+                                v
+                                for v in target_asset.headshot_asset.variants
+                                if v.id == target_asset.headshot_asset.selected_id
+                            ),
+                            None,
+                        )
+                        target_asset.headshot_image_url = (
+                            selected.url if selected else None
+                        )
                     else:
                         target_asset.headshot_image_url = None
 
         elif asset_type == "scene":
             target_asset = next((s for s in script.scenes if s.id == asset_id), None)
-            if target_asset and self._delete_variant_in_asset(target_asset.image_asset, variant_id):
+            if target_asset and self._delete_variant_in_asset(
+                target_asset.image_asset, variant_id
+            ):
                 if target_asset.image_asset.selected_id:
-                    selected = next((v for v in target_asset.image_asset.variants if v.id == target_asset.image_asset.selected_id), None)
+                    selected = next(
+                        (
+                            v
+                            for v in target_asset.image_asset.variants
+                            if v.id == target_asset.image_asset.selected_id
+                        ),
+                        None,
+                    )
                     target_asset.image_url = selected.url if selected else None
                 else:
                     target_asset.image_url = None
 
         elif asset_type == "prop":
             target_asset = next((p for p in script.props if p.id == asset_id), None)
-            if target_asset and self._delete_variant_in_asset(target_asset.image_asset, variant_id):
+            if target_asset and self._delete_variant_in_asset(
+                target_asset.image_asset, variant_id
+            ):
                 if target_asset.image_asset.selected_id:
-                    selected = next((v for v in target_asset.image_asset.variants if v.id == target_asset.image_asset.selected_id), None)
+                    selected = next(
+                        (
+                            v
+                            for v in target_asset.image_asset.variants
+                            if v.id == target_asset.image_asset.selected_id
+                        ),
+                        None,
+                    )
                     target_asset.image_url = selected.url if selected else None
                 else:
                     target_asset.image_url = None
@@ -3773,21 +4856,44 @@ class ComicGenPipeline:
         elif asset_type == "storyboard_frame":
             target_asset = next((f for f in script.frames if f.id == asset_id), None)
             if target_asset:
-                if self._delete_variant_in_asset(target_asset.rendered_image_asset, variant_id):
+                if self._delete_variant_in_asset(
+                    target_asset.rendered_image_asset, variant_id
+                ):
                     if target_asset.rendered_image_asset.selected_id:
-                        selected = next((v for v in target_asset.rendered_image_asset.variants if v.id == target_asset.rendered_image_asset.selected_id), None)
-                        target_asset.rendered_image_url = selected.url if selected else None
+                        selected = next(
+                            (
+                                v
+                                for v in target_asset.rendered_image_asset.variants
+                                if v.id == target_asset.rendered_image_asset.selected_id
+                            ),
+                            None,
+                        )
+                        target_asset.rendered_image_url = (
+                            selected.url if selected else None
+                        )
                         target_asset.image_url = selected.url if selected else None
                     else:
                         target_asset.rendered_image_url = None
-                        # Don't clear image_url if it might fall back to sketch? 
+                        # Don't clear image_url if it might fall back to sketch?
                         # For now, clear it if rendered is cleared.
                         target_asset.image_url = None
 
         self._save_data()
         return script
 
-    def update_model_settings(self, script_id: str, t2i_model: str = None, i2i_model: str = None, i2v_model: str = None, r2v_model: str = None, character_aspect_ratio: str = None, scene_aspect_ratio: str = None, prop_aspect_ratio: str = None, storyboard_aspect_ratio: str = None, image_model: str = None) -> Script:
+    def update_model_settings(
+        self,
+        script_id: str,
+        t2i_model: str = None,
+        i2i_model: str = None,
+        i2v_model: str = None,
+        r2v_model: str = None,
+        character_aspect_ratio: str = None,
+        scene_aspect_ratio: str = None,
+        prop_aspect_ratio: str = None,
+        storyboard_aspect_ratio: str = None,
+        image_model: str = None,
+    ) -> Script:
         """Updates the model settings for a script."""
         script = self.scripts.get(script_id)
         if not script:
@@ -3815,7 +4921,9 @@ class ComicGenPipeline:
         self._save_data()
         return script
 
-    def _set_variant_favorite(self, image_asset: Any, variant_id: str, is_favorited: bool) -> bool:
+    def _set_variant_favorite(
+        self, image_asset: Any, variant_id: str, is_favorited: bool
+    ) -> bool:
         """Helper to set favorite status of a variant. Returns True if found."""
         if not image_asset or not image_asset.variants:
             return False
@@ -3825,44 +4933,75 @@ class ComicGenPipeline:
                 return True
         return False
 
-    def toggle_variant_favorite(self, script_id: str, asset_id: str, asset_type: str, variant_id: str, is_favorited: bool, generation_type: str = None) -> Script:
+    def toggle_variant_favorite(
+        self,
+        script_id: str,
+        asset_id: str,
+        asset_type: str,
+        variant_id: str,
+        is_favorited: bool,
+        generation_type: str = None,
+    ) -> Script:
         """Toggles the favorite status of a variant."""
         script = self.scripts.get(script_id)
         if not script:
             raise ValueError("Script not found")
-        
+
         found = False
         if asset_type == "character":
-            target_asset = next((c for c in script.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in script.characters if c.id == asset_id), None
+            )
             if target_asset:
                 if generation_type == "full_body":
-                    found = self._set_variant_favorite(target_asset.full_body_asset, variant_id, is_favorited)
+                    found = self._set_variant_favorite(
+                        target_asset.full_body_asset, variant_id, is_favorited
+                    )
                 elif generation_type == "three_view":
-                    found = self._set_variant_favorite(target_asset.three_view_asset, variant_id, is_favorited)
+                    found = self._set_variant_favorite(
+                        target_asset.three_view_asset, variant_id, is_favorited
+                    )
                 elif generation_type == "headshot":
-                    found = self._set_variant_favorite(target_asset.headshot_asset, variant_id, is_favorited)
+                    found = self._set_variant_favorite(
+                        target_asset.headshot_asset, variant_id, is_favorited
+                    )
                 else:
                     # Try all character assets
-                    found = self._set_variant_favorite(target_asset.full_body_asset, variant_id, is_favorited) or \
-                            self._set_variant_favorite(target_asset.three_view_asset, variant_id, is_favorited) or \
-                            self._set_variant_favorite(target_asset.headshot_asset, variant_id, is_favorited)
-        
+                    found = (
+                        self._set_variant_favorite(
+                            target_asset.full_body_asset, variant_id, is_favorited
+                        )
+                        or self._set_variant_favorite(
+                            target_asset.three_view_asset, variant_id, is_favorited
+                        )
+                        or self._set_variant_favorite(
+                            target_asset.headshot_asset, variant_id, is_favorited
+                        )
+                    )
+
         elif asset_type == "scene":
             target_asset = next((s for s in script.scenes if s.id == asset_id), None)
             if target_asset:
-                found = self._set_variant_favorite(target_asset.image_asset, variant_id, is_favorited)
-        
+                found = self._set_variant_favorite(
+                    target_asset.image_asset, variant_id, is_favorited
+                )
+
         elif asset_type == "prop":
             target_asset = next((p for p in script.props if p.id == asset_id), None)
             if target_asset:
-                found = self._set_variant_favorite(target_asset.image_asset, variant_id, is_favorited)
-        
+                found = self._set_variant_favorite(
+                    target_asset.image_asset, variant_id, is_favorited
+                )
+
         elif asset_type == "storyboard_frame":
             target_asset = next((f for f in script.frames if f.id == asset_id), None)
             if target_asset:
-                found = self._set_variant_favorite(target_asset.rendered_image_asset, variant_id, is_favorited) or \
-                        self._set_variant_favorite(target_asset.image_asset, variant_id, is_favorited)
-        
+                found = self._set_variant_favorite(
+                    target_asset.rendered_image_asset, variant_id, is_favorited
+                ) or self._set_variant_favorite(
+                    target_asset.image_asset, variant_id, is_favorited
+                )
+
         if not found:
             raise ValueError(f"Variant {variant_id} not found")
 
@@ -3877,7 +5016,7 @@ class ComicGenPipeline:
         if not os.path.exists(self.series_data_file):
             return {}
         try:
-            with open(self.series_data_file, 'r') as f:
+            with open(self.series_data_file, "r") as f:
                 data = json.load(f)
                 return {k: Series(**v) for k, v in data.items()}
         except Exception as e:
@@ -3888,8 +5027,12 @@ class ComicGenPipeline:
         """Save series data without acquiring the lock (caller must hold self._save_lock)."""
         try:
             os.makedirs(os.path.dirname(self.series_data_file) or ".", exist_ok=True)
-            with open(self.series_data_file, 'w') as f:
-                json.dump({k: v.model_dump() for k, v in self.series_store.items()}, f, indent=2)
+            with open(self.series_data_file, "w") as f:
+                json.dump(
+                    {k: v.model_dump() for k, v in self.series_store.items()},
+                    f,
+                    indent=2,
+                )
         except Exception as e:
             logger.error(f"Failed to save series data: {e}")
 
@@ -3906,7 +5049,7 @@ class ComicGenPipeline:
         if not os.path.exists(self.library_data_file):
             return GlobalAssetLibrary()
         try:
-            with open(self.library_data_file, 'r') as f:
+            with open(self.library_data_file, "r") as f:
                 data = json.load(f)
                 return GlobalAssetLibrary(**data)
         except Exception as e:
@@ -3917,7 +5060,7 @@ class ComicGenPipeline:
         """Save global library data without acquiring the lock (caller must hold self._save_lock)."""
         try:
             os.makedirs(os.path.dirname(self.library_data_file) or ".", exist_ok=True)
-            with open(self.library_data_file, 'w') as f:
+            with open(self.library_data_file, "w") as f:
                 json.dump(self.library_store.model_dump(), f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save library data: {e}")
@@ -3953,7 +5096,9 @@ class ComicGenPipeline:
         target_list = self._library_list_for_type(asset_type)
         asset = next((a for a in target_list if a.id == asset_id), None)
         if asset is None:
-            raise ValueError(f"Asset {asset_id} of type {asset_type} not found in library")
+            raise ValueError(
+                f"Asset {asset_id} of type {asset_type} not found in library"
+            )
         return asset
 
     def list_library_assets(self) -> GlobalAssetLibrary:
@@ -3974,6 +5119,7 @@ class ComicGenPipeline:
         description, image_url, persona (characters), voice_id
         (characters)."""
         from .models import Character, Scene, Prop, AssetUnit, ImageVariant
+
         with self._save_lock:
             payload = dict(payload or {})
             name = payload.get("name") or "未命名"
@@ -3982,7 +5128,9 @@ class ComicGenPipeline:
             if asset_type == "character":
                 ref_sheet = AssetUnit()
                 if image_url:
-                    variant = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=image_url)
+                    variant = ImageVariant(
+                        id=f"img_{uuid.uuid4().hex[:12]}", url=image_url
+                    )
                     ref_sheet.image_variants.append(variant)
                     ref_sheet.selected_image_id = variant.id
                 asset = Character(
@@ -3992,6 +5140,13 @@ class ComicGenPipeline:
                     persona=payload.get("persona") or "",
                     voice_id=payload.get("voice_id"),
                     reference_sheet=ref_sheet,
+                    role=payload.get("role") or "配角",
+                    aliases=payload.get("aliases") or [],
+                    clothing=payload.get("clothing"),
+                    age=payload.get("age"),
+                    gender=payload.get("gender"),
+                    prompt_en=payload.get("prompt_en") or "",
+                    visual_weight=payload.get("visual_weight") or 3,
                 )
             elif asset_type == "scene":
                 asset = Scene(
@@ -4013,20 +5168,36 @@ class ComicGenPipeline:
             self._save_library_data_unlocked()
             return asset
 
-    def update_library_asset(self, asset_type: str, asset_id: str, patch: Dict[str, Any]):
+    def update_library_asset(
+        self, asset_type: str, asset_id: str, patch: Dict[str, Any]
+    ):
         """Patch attributes of a global library asset and persist. Mirrors
         update_series_asset_attributes — only sets keys that exist on the
         asset, and never touches id/status (use create/delete to manage
         those)."""
         with self._save_lock:
             asset = self._find_library_asset(asset_type, asset_id)
+            image_url = (patch or {}).get("image_url")
+            if asset_type == "character" and image_url:
+                # Characters display from reference_sheet, so a bare image_url
+                # patch would not replace the visible art. Swap the canonical
+                # master variant too.
+                from .models import AssetUnit, ImageVariant
+
+                ref_sheet = getattr(asset, "reference_sheet", None) or AssetUnit()
+                variant = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=image_url)
+                ref_sheet.image_variants = [variant]
+                ref_sheet.selected_image_id = variant.id
+                asset.reference_sheet = ref_sheet
             for key, value in (patch or {}).items():
                 if hasattr(asset, key) and key not in ("id", "status"):
                     setattr(asset, key, value)
             self._save_library_data_unlocked()
             return asset
 
-    def _scan_library_asset_references(self, asset_type: str, asset_id: str) -> List[Dict[str, Any]]:
+    def _scan_library_asset_references(
+        self, asset_type: str, asset_id: str
+    ) -> List[Dict[str, Any]]:
         """Find every storyboard frame (across all projects and series) that
         references the given asset id through the type-appropriate field:
         scene -> frame.scene_id, character -> frame.character_ids,
@@ -4052,12 +5223,14 @@ class ComicGenPipeline:
         def _scan(owner_kind: str, owner_id: str, owner, frames) -> None:
             for frame in frames or []:
                 if _frame_hits(frame):
-                    references.append({
-                        "owner_kind": owner_kind,
-                        "owner_id": owner_id,
-                        "owner_title": getattr(owner, "title", None),
-                        "frame_id": getattr(frame, "id", None),
-                    })
+                    references.append(
+                        {
+                            "owner_kind": owner_kind,
+                            "owner_id": owner_id,
+                            "owner_title": getattr(owner, "title", None),
+                            "frame_id": getattr(frame, "id", None),
+                        }
+                    )
 
         for sid, script in (getattr(self, "scripts", {}) or {}).items():
             _scan("project", sid, script, getattr(script, "frames", None))
@@ -4065,7 +5238,9 @@ class ComicGenPipeline:
             _scan("series", sid, series, getattr(series, "frames", None))
         return references
 
-    def delete_library_asset(self, asset_type: str, asset_id: str, force: bool = False) -> None:
+    def delete_library_asset(
+        self, asset_type: str, asset_id: str, force: bool = False
+    ) -> None:
         """Hard-delete a global library asset.
 
         Design Q2 (reference integrity): unless ``force`` is True, scan all
@@ -4080,7 +5255,9 @@ class ComicGenPipeline:
         with self._save_lock:
             target_list = self._library_list_for_type(asset_type)
             if not any(a.id == asset_id for a in target_list):
-                raise ValueError(f"Asset {asset_id} of type {asset_type} not found in library")
+                raise ValueError(
+                    f"Asset {asset_id} of type {asset_type} not found in library"
+                )
             if not force:
                 refs = self._scan_library_asset_references(asset_type, asset_id)
                 if refs:
@@ -4094,7 +5271,9 @@ class ComicGenPipeline:
                 self.library_store.props = kept
             self._save_library_data_unlocked()
 
-    def promote_asset_to_library(self, source_kind: str, source_id: str, asset_type: str, asset_id: str):
+    def promote_asset_to_library(
+        self, source_kind: str, source_id: str, asset_type: str, asset_id: str
+    ):
         """Deep-copy an asset from a Project (episode) or Series into the
         global library with a fresh id, persist, and return the new asset.
 
@@ -4103,6 +5282,7 @@ class ComicGenPipeline:
         fork-on-use of the original is a documented follow-up, design Q3).
         `source_kind` ∈ {"project", "series"}."""
         import copy
+
         if asset_type not in ("character", "scene", "prop"):
             raise ValueError(f"Invalid asset type: {asset_type}")
         with self._save_lock:
@@ -4135,7 +5315,9 @@ class ComicGenPipeline:
             self._save_library_data_unlocked()
             return new_asset
 
-    def fork_library_asset_to_project(self, script_id: str, asset_type: str, library_asset_id: str):
+    def fork_library_asset_to_project(
+        self, script_id: str, asset_type: str, library_asset_id: str
+    ):
         """Deep-copy a *global library* asset into a project's local asset list
         with a fresh id, persist the project, and return the new (now
         project-owned) asset.
@@ -4149,6 +5331,7 @@ class ComicGenPipeline:
         Raises ValueError when the project, asset type, or library asset is
         absent. ``asset_type`` ∈ {"character", "scene", "prop"}."""
         import copy
+
         if asset_type not in ("character", "scene", "prop"):
             raise ValueError(f"Invalid asset type: {asset_type}")
         with self._save_lock:
@@ -4170,9 +5353,38 @@ class ComicGenPipeline:
             self._save_data()
             return new_asset
 
-    def create_series(self, title: str, description: str = "", workflow_mode: str = "i2v_legacy", content_mode: str = "scripted", default_generation_mode: str = "r2v") -> Series:
+    @staticmethod
+    def _normalize_series_title(title: str) -> str:
+        return (title or "").strip().casefold()
+
+    def _ensure_unique_series_title(
+        self, title: str, exclude_id: Optional[str] = None
+    ) -> None:
+        """Reject a Series title that another Series already uses.
+
+        Comparison is case-insensitive and whitespace-trimmed so that
+        "凡人修仙传" and " 凡人修仙传 " are treated as the same name.
+        """
+        normalized = self._normalize_series_title(title)
+        if not normalized:
+            return
+        for existing in self.series_store.values():
+            if existing.id == exclude_id:
+                continue
+            if self._normalize_series_title(existing.title) == normalized:
+                raise DuplicateSeriesTitleError(title.strip())
+
+    def create_series(
+        self,
+        title: str,
+        description: str = "",
+        workflow_mode: str = "i2v_legacy",
+        content_mode: str = "scripted",
+        default_generation_mode: str = "r2v",
+    ) -> Series:
         """Create a new Series."""
         with self._save_lock:
+            self._ensure_unique_series_title(title)
             series = Series(
                 id=str(uuid.uuid4()),
                 title=title,
@@ -4180,9 +5392,34 @@ class ComicGenPipeline:
                 workflow_mode=workflow_mode,
                 content_mode=content_mode,
                 default_generation_mode=default_generation_mode,
+                art_direction=ArtDirection(
+                    selected_style_id="guofeng_manhua_2d",
+                    style_config={
+                        "id": "guofeng_manhua_2d",
+                        "category": "custom",
+                        "name": "国漫2D · 修仙漫画",
+                        "name_zh": "国漫2D · 修仙漫画",
+                        "subtitle_zh": "2D漫画分镜 · 宏大仙界 · 法术特效",
+                        "description": "2D 国漫/漫画分镜风：赛璐璐上色、清晰线稿、宏大仙界与法术特效。",
+                        "best_for": ["仙侠", "剧情", "宏大场景", "法术"],
+                        "avoid_for": ["3D写实", "现代"],
+                        "positive_prompt": "Chinese manhua 2D illustration, cel shading, clean line art, grand xianxia immortal realm, floating mountains, celestial palaces, glowing spell arrays, talismans, spirit qi, dramatic lighting, detailed background, high quality",
+                        "negative_prompt": "3D CG, photorealistic, western fantasy, modern, modern road, asphalt, car, concrete, plastic, low quality, blurry, text, watermark",
+                    },
+                    custom_styles=[],
+                    ai_recommendations=[],
+                ),
                 created_at=time.time(),
                 updated_at=time.time(),
             )
+            try:
+                import json as _json
+
+                series.world_bible = _json.loads(
+                    open("data/world_bible.json", encoding="utf-8").read()
+                )
+            except Exception:
+                pass
             self.series_store[series.id] = series
             self._save_series_data_unlocked()
             return series
@@ -4199,8 +5436,15 @@ class ComicGenPipeline:
             series = self.series_store.get(series_id)
             if not series:
                 raise ValueError("Series not found")
+            new_title = updates.get("title")
+            if isinstance(new_title, str):
+                self._ensure_unique_series_title(new_title, exclude_id=series_id)
             for key, value in updates.items():
-                if hasattr(series, key) and key not in ("id", "created_at", "episode_ids"):
+                if hasattr(series, key) and key not in (
+                    "id",
+                    "created_at",
+                    "episode_ids",
+                ):
                     if key == "art_direction" and isinstance(value, dict):
                         value = ArtDirection(**value)
                     setattr(series, key, value)
@@ -4225,7 +5469,9 @@ class ComicGenPipeline:
             del self.series_store[series_id]
             self._save_series_data_unlocked()
 
-    def add_episode_to_series(self, series_id: str, script_id: str, episode_number: Optional[int] = None) -> Series:
+    def add_episode_to_series(
+        self, series_id: str, script_id: str, episode_number: Optional[int] = None
+    ) -> Series:
         """Add an existing Script/Project as an Episode to a Series."""
         with self._save_lock:
             series = self.series_store.get(series_id)
@@ -4277,7 +5523,7 @@ class ComicGenPipeline:
         audio_url: str,
         label: str,
         target_model: str = "cosyvoice-v3.5-plus",
-    ) -> 'CustomVoice':
+    ) -> "CustomVoice":
         """Clone a voice from a reference audio URL via dashscope customization.
 
         Calls /services/audio/tts/customization with model='voice-enrollment'
@@ -4301,7 +5547,9 @@ class ComicGenPipeline:
 
             # Dashscope customization endpoint (Beijing region; intl uses
             # dashscope-intl URL — TODO when LumenX supports intl deployment)
-            url = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
+            url = (
+                "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
+            )
             payload = {
                 "model": "voice-enrollment",
                 "input": {
@@ -4311,13 +5559,22 @@ class ComicGenPipeline:
                     "url": audio_url,
                 },
             }
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
 
-            logger.info(f"[voice/clone] creating voice for series={series_id} label='{label}' target={target_model}")
+            logger.info(
+                f"[voice/clone] creating voice for series={series_id} label='{label}' target={target_model}"
+            )
             resp = requests.post(url, json=payload, headers=headers, timeout=60)
             if resp.status_code != 200:
-                logger.error(f"[voice/clone] dashscope error {resp.status_code}: {resp.text[:500]}")
-                raise RuntimeError(f"Voice clone failed: HTTP {resp.status_code} — {resp.text[:200]}")
+                logger.error(
+                    f"[voice/clone] dashscope error {resp.status_code}: {resp.text[:500]}"
+                )
+                raise RuntimeError(
+                    f"Voice clone failed: HTTP {resp.status_code} — {resp.text[:200]}"
+                )
 
             data = resp.json()
             # Per doc shape: output.voice (CosyVoice) or output.voice_id (Qwen-TTS)
@@ -4328,7 +5585,9 @@ class ComicGenPipeline:
             )
             if not voice_id:
                 logger.error(f"[voice/clone] no voice_id in response: {data}")
-                raise RuntimeError(f"Voice clone succeeded but voice_id missing in response: {data}")
+                raise RuntimeError(
+                    f"Voice clone succeeded but voice_id missing in response: {data}"
+                )
 
             custom = CustomVoice(
                 id=str(voice_id),
@@ -4343,10 +5602,12 @@ class ComicGenPipeline:
             series.custom_voices.append(custom)
             series.updated_at = time.time()
             self._save_series_data_unlocked()
-            logger.info(f"[voice/clone] success voice_id={voice_id} stored on series={series_id}")
+            logger.info(
+                f"[voice/clone] success voice_id={voice_id} stored on series={series_id}"
+            )
             return custom
 
-    def list_custom_voices(self, series_id: str) -> List['CustomVoice']:
+    def list_custom_voices(self, series_id: str) -> List["CustomVoice"]:
         """Return all custom voices in a series (clones + designs).
         Empty list if series has none or doesn't exist."""
         series = self.series_store.get(series_id)
@@ -4370,12 +5631,12 @@ class ComicGenPipeline:
                 self._save_series_data_unlocked()
             return removed
 
-    def find_custom_voice(self, voice_id: str) -> Optional['CustomVoice']:
+    def find_custom_voice(self, voice_id: str) -> Optional["CustomVoice"]:
         """Search all series for a custom voice by voice_id. Used by
         /voice/preview to resolve target_model for cloned/designed voices
         (which aren't in the static TTS_VOICE_REGISTRY)."""
         for series in self.series_store.values():
-            for cv in (series.custom_voices or []):
+            for cv in series.custom_voices or []:
                 if cv.id == voice_id:
                     return cv
         return None
@@ -4421,9 +5682,14 @@ class ComicGenPipeline:
                 "preview_text": (preview_text or "你好，这是一段音色测试。")[:200],
             },
         }
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
-        logger.info(f"[voice/design] preview voice_prompt='{voice_prompt[:60]}…' target={target_model}")
+        logger.info(
+            f"[voice/design] preview voice_prompt='{voice_prompt[:60]}…' target={target_model}"
+        )
         # dashscope voice design has variable latency (10-60s); the customization
         # service occasionally returns its own timeout. Retry once on 5xx/timeout.
         resp = None
@@ -4436,10 +5702,14 @@ class ComicGenPipeline:
                 last_err = f"HTTP {resp.status_code} — {resp.text[:200]}"
                 if resp.status_code < 500 and "Timeout" not in (resp.text or ""):
                     break  # client error, don't retry
-                logger.warning(f"[voice/design] attempt {attempt+1} failed: {last_err}; retrying")
+                logger.warning(
+                    f"[voice/design] attempt {attempt + 1} failed: {last_err}; retrying"
+                )
             except requests.RequestException as e:
                 last_err = str(e)
-                logger.warning(f"[voice/design] attempt {attempt+1} network error: {e}; retrying")
+                logger.warning(
+                    f"[voice/design] attempt {attempt + 1} network error: {e}; retrying"
+                )
         if resp is None or resp.status_code != 200:
             logger.error(f"[voice/design] all attempts failed: {last_err}")
             raise RuntimeError(f"Voice design failed: {last_err}")
@@ -4447,7 +5717,11 @@ class ComicGenPipeline:
         data = resp.json()
         output = data.get("output", {}) or {}
         voice_id = output.get("voice") or output.get("voice_id") or data.get("voice")
-        remote_preview = output.get("preview_audio") or output.get("preview_audio_url") or output.get("audio_url")
+        remote_preview = (
+            output.get("preview_audio")
+            or output.get("preview_audio_url")
+            or output.get("audio_url")
+        )
         if not voice_id:
             logger.error(f"[voice/design] no voice_id in response: {data}")
             raise RuntimeError(f"Voice design API returned no voice_id: {data}")
@@ -4456,7 +5730,9 @@ class ComicGenPipeline:
 
         cache_dir = "output/cache/voice_design_preview"
         os.makedirs(cache_dir, exist_ok=True)
-        cache_key = hashlib.md5(f"{voice_id_str}|{preview_text}".encode("utf-8")).hexdigest()
+        cache_key = hashlib.md5(
+            f"{voice_id_str}|{preview_text}".encode("utf-8")
+        ).hexdigest()
         cache_path = os.path.join(cache_dir, f"{cache_key}.mp3")
 
         if remote_preview:
@@ -4467,7 +5743,9 @@ class ComicGenPipeline:
                 with open(cache_path, "wb") as f:
                     f.write(audio_resp.content)
             except Exception as e:
-                logger.warning(f"[voice/design] preview download failed, falling back to local TTS: {e}")
+                logger.warning(
+                    f"[voice/design] preview download failed, falling back to local TTS: {e}"
+                )
                 remote_preview = None
 
         if not remote_preview:
@@ -4482,7 +5760,11 @@ class ComicGenPipeline:
             )
 
         preview_url = f"cache/voice_design_preview/{cache_key}.mp3"
-        return {"voice_id": voice_id_str, "preview_url": preview_url, "target_model": target_model}
+        return {
+            "voice_id": voice_id_str,
+            "preview_url": preview_url,
+            "target_model": target_model,
+        }
 
     def voice_design_save(
         self,
@@ -4491,7 +5773,7 @@ class ComicGenPipeline:
         voice_prompt: str,
         label: str,
         target_model: str = "cosyvoice-v3.5-plus",
-    ) -> 'CustomVoice':
+    ) -> "CustomVoice":
         """Persist a previewed design voice into series.custom_voices[]."""
         from .models import CustomVoice
 
@@ -4505,7 +5787,9 @@ class ComicGenPipeline:
                 None,
             )
             if existing:
-                logger.info(f"[voice/design] save: voice_id={voice_id} already exists; returning existing")
+                logger.info(
+                    f"[voice/design] save: voice_id={voice_id} already exists; returning existing"
+                )
                 return existing
 
             custom = CustomVoice(
@@ -4521,7 +5805,9 @@ class ComicGenPipeline:
             series.custom_voices.append(custom)
             series.updated_at = time.time()
             self._save_series_data_unlocked()
-            logger.info(f"[voice/design] saved voice_id={voice_id} to series={series_id}")
+            logger.info(
+                f"[voice/design] saved voice_id={voice_id} to series={series_id}"
+            )
             return custom
 
     def translate_character_to_voice_prompt(self, description: str) -> str:
@@ -4567,7 +5853,9 @@ class ComicGenPipeline:
                 episodes.append(script)
         return episodes
 
-    def resolve_episode_assets(self, episode: Script, series: Optional[Series] = None) -> Dict[str, List]:
+    def resolve_episode_assets(
+        self, episode: Script, series: Optional[Series] = None
+    ) -> Dict[str, List]:
         """Merge Episode-local assets with Series shared assets and the
         project-independent global asset library. Priority by ID:
         Episode > Series > Global (local always wins). The global library
@@ -4586,18 +5874,27 @@ class ComicGenPipeline:
             ep_scene_ids = {s.id for s in episode.scenes}
             ep_prop_ids = {p.id for p in episode.props}
             return {
-                "characters": list(episode.characters) + [c for c in self.library_store.characters if c.id not in ep_char_ids],
-                "scenes": list(episode.scenes) + [s for s in self.library_store.scenes if s.id not in ep_scene_ids],
-                "props": list(episode.props) + [p for p in self.library_store.props if p.id not in ep_prop_ids],
+                "characters": list(episode.characters)
+                + [c for c in self.library_store.characters if c.id not in ep_char_ids],
+                "scenes": list(episode.scenes)
+                + [s for s in self.library_store.scenes if s.id not in ep_scene_ids],
+                "props": list(episode.props)
+                + [p for p in self.library_store.props if p.id not in ep_prop_ids],
             }
         # Build lookup by ID for episode-local assets
         ep_char_ids = {c.id for c in episode.characters}
         ep_scene_ids = {s.id for s in episode.scenes}
         ep_prop_ids = {p.id for p in episode.props}
 
-        merged_characters = list(episode.characters) + [c for c in series.characters if c.id not in ep_char_ids]
-        merged_scenes = list(episode.scenes) + [s for s in series.scenes if s.id not in ep_scene_ids]
-        merged_props = list(episode.props) + [p for p in series.props if p.id not in ep_prop_ids]
+        merged_characters = list(episode.characters) + [
+            c for c in series.characters if c.id not in ep_char_ids
+        ]
+        merged_scenes = list(episode.scenes) + [
+            s for s in series.scenes if s.id not in ep_scene_ids
+        ]
+        merged_props = list(episode.props) + [
+            p for p in series.props if p.id not in ep_prop_ids
+        ]
 
         # Fold the global library underneath as the lowest layer — only
         # ids absent from both the Episode and Series layers. No-op when
@@ -4606,9 +5903,15 @@ class ComicGenPipeline:
         merged_scene_ids = {s.id for s in merged_scenes}
         merged_prop_ids = {p.id for p in merged_props}
 
-        merged_characters += [c for c in self.library_store.characters if c.id not in merged_char_ids]
-        merged_scenes += [s for s in self.library_store.scenes if s.id not in merged_scene_ids]
-        merged_props += [p for p in self.library_store.props if p.id not in merged_prop_ids]
+        merged_characters += [
+            c for c in self.library_store.characters if c.id not in merged_char_ids
+        ]
+        merged_scenes += [
+            s for s in self.library_store.scenes if s.id not in merged_scene_ids
+        ]
+        merged_props += [
+            p for p in self.library_store.props if p.id not in merged_prop_ids
+        ]
 
         return {
             "characters": merged_characters,
@@ -4620,12 +5923,15 @@ class ComicGenPipeline:
     # File Import & Episode Splitting
     # ============================================================
 
-    def import_file_and_split(self, text: str, suggested_episodes: int = 3) -> List[Dict]:
+    def import_file_and_split(
+        self, text: str, suggested_episodes: int = 3
+    ) -> List[Dict]:
         """Split text into episodes using LLM. Returns episode preview data."""
         return self.script_processor.split_into_episodes(text, suggested_episodes)
 
-    def create_series_from_import(self, title: str, text: str, episodes_data: List[Dict],
-                                   description: str = "") -> Dict:
+    def create_series_from_import(
+        self, title: str, text: str, episodes_data: List[Dict], description: str = ""
+    ) -> Dict:
         """Create a Series with Episodes from import data.
         episodes_data: list of dicts with episode_number, title, start_marker, end_marker."""
         # Create the Series (already acquires lock internally)
@@ -4639,7 +5945,7 @@ class ComicGenPipeline:
             created_episodes = []
             for idx, ep_data in enumerate(episodes_data):
                 ep_text = episode_texts[idx] if idx < len(episode_texts) else ""
-                ep_title = ep_data.get("title", f"第{idx+1}集")
+                ep_title = ep_data.get("title", f"第{idx + 1}集")
                 episode_number = ep_data.get("episode_number", idx + 1)
 
                 # Create draft script (no LLM analysis yet — user can trigger later)
@@ -4649,12 +5955,14 @@ class ComicGenPipeline:
                 self.scripts[script.id] = script
 
                 series.episode_ids.append(script.id)
-                created_episodes.append({
-                    "id": script.id,
-                    "title": ep_title,
-                    "episode_number": episode_number,
-                    "text_length": len(ep_text),
-                })
+                created_episodes.append(
+                    {
+                        "id": script.id,
+                        "title": ep_title,
+                        "episode_number": episode_number,
+                        "text_length": len(ep_text),
+                    }
+                )
 
             self._save_data()
             self._save_series_data_unlocked()
@@ -4714,45 +6022,244 @@ class ComicGenPipeline:
             raise ValueError("Series not found")
         target_asset = None
         if asset_type == "character":
-            target_asset = next((c for c in series.characters if c.id == asset_id), None)
+            target_asset = next(
+                (c for c in series.characters if c.id == asset_id), None
+            )
         elif asset_type == "scene":
             target_asset = next((s for s in series.scenes if s.id == asset_id), None)
         elif asset_type == "prop":
             target_asset = next((p for p in series.props if p.id == asset_id), None)
         if not target_asset:
-            raise ValueError(f"Asset {asset_id} of type {asset_type} not found in series")
+            raise ValueError(
+                f"Asset {asset_id} of type {asset_type} not found in series"
+            )
         return series, target_asset
 
-    def toggle_series_asset_lock(self, series_id: str, asset_id: str, asset_type: str) -> Series:
+    def toggle_series_asset_lock(
+        self, series_id: str, asset_id: str, asset_type: str
+    ) -> Series:
         """Toggle the locked status of a Series asset."""
         with self._save_lock:
-            series, target_asset = self._find_series_asset(series_id, asset_id, asset_type)
+            series, target_asset = self._find_series_asset(
+                series_id, asset_id, asset_type
+            )
             target_asset.locked = not target_asset.locked
             self._save_series_data_unlocked()
             return series
 
-    def toggle_series_asset_starred(self, series_id: str, asset_id: str, asset_type: str) -> Series:
+    def toggle_series_asset_starred(
+        self, series_id: str, asset_id: str, asset_type: str
+    ) -> Series:
         """Toggle the starred (library shortlist) status of a Series asset."""
         with self._save_lock:
-            series, target_asset = self._find_series_asset(series_id, asset_id, asset_type)
+            series, target_asset = self._find_series_asset(
+                series_id, asset_id, asset_type
+            )
             target_asset.starred = not target_asset.starred
             self._save_series_data_unlocked()
             return series
 
-    def update_series_asset_image(self, series_id: str, asset_id: str, asset_type: str, image_url: str) -> Series:
+    def _find_series_image_unit(self, target, asset_type: str, variant_id: str):
+        """Return (unit, kind) for the unit that owns `variant_id`.
+
+        kind is "asset_unit" (AssetUnit: image_variants/selected_image_id) or
+        "image_asset" (ImageAsset: variants/selected_id).
+        """
+        if asset_type == "character":
+            units = [
+                target.reference_sheet,
+                target.full_body_asset,
+                target.three_view_asset,
+                target.headshot_asset,
+            ]
+        else:
+            units = [target.image_asset]
+        for unit in units:
+            if unit is None:
+                continue
+            if any(
+                v.id == variant_id
+                for v in (getattr(unit, "image_variants", None) or [])
+            ):
+                return unit, "asset_unit"
+            if any(v.id == variant_id for v in (getattr(unit, "variants", None) or [])):
+                return unit, "image_asset"
+        return None, None
+
+    def select_series_asset_variant(
+        self, series_id: str, asset_id: str, asset_type: str, variant_id: str
+    ) -> Series:
+        """Select one generated variant as the asset's active image."""
+        with self._save_lock:
+            series, target_asset = self._find_series_asset(
+                series_id, asset_id, asset_type
+            )
+            unit, kind = self._find_series_image_unit(
+                target_asset, asset_type, variant_id
+            )
+            if unit is None:
+                raise ValueError("Variant not found for this asset")
+            if kind == "asset_unit":
+                unit.selected_image_id = variant_id
+                chosen = next(v for v in unit.image_variants if v.id == variant_id)
+            else:
+                unit.selected_id = variant_id
+                chosen = next(v for v in unit.variants if v.id == variant_id)
+
+            if asset_type == "character":
+                if unit is target_asset.reference_sheet:
+                    target_asset.image_url = chosen.url
+                    target_asset.avatar_url = chosen.url
+                elif unit is target_asset.full_body_asset:
+                    target_asset.full_body_image_url = chosen.url
+                elif unit is target_asset.three_view_asset:
+                    target_asset.three_view_image_url = chosen.url
+                elif unit is target_asset.headshot_asset:
+                    target_asset.headshot_image_url = chosen.url
+            else:
+                target_asset.image_url = chosen.url
+            series.updated_at = time.time()
+            self._save_series_data_unlocked()
+            return series
+
+    def delete_series_asset(
+        self, series_id: str, asset_id: str, asset_type: str
+    ) -> Series:
+        """Delete a single asset from a Series library."""
+        with self._save_lock:
+            series, _ = self._find_series_asset(series_id, asset_id, asset_type)
+            pool_attr = {"character": "characters", "scene": "scenes", "prop": "props"}[
+                asset_type
+            ]
+            pool = [x for x in getattr(series, pool_attr) if x.id != asset_id]
+            setattr(series, pool_attr, pool)
+            series.updated_at = time.time()
+            self._save_series_data_unlocked()
+            return series
+
+    def delete_series_asset_variant(
+        self, series_id: str, asset_id: str, asset_type: str, variant_id: str
+    ) -> Series:
+        """Delete a single variant from any of a Series asset's image units."""
+        with self._save_lock:
+            series, target = self._find_series_asset(series_id, asset_id, asset_type)
+            unit, kind = self._find_series_image_unit(target, asset_type, variant_id)
+            if unit is None:
+                raise ValueError("Variant not found for this asset")
+            if kind == "asset_unit":
+                remaining = [v for v in unit.image_variants if v.id != variant_id]
+                unit.image_variants = remaining
+                if unit.selected_image_id == variant_id:
+                    unit.selected_image_id = remaining[0].id if remaining else None
+            else:
+                remaining = [v for v in unit.variants if v.id != variant_id]
+                unit.variants = remaining
+                if unit.selected_id == variant_id:
+                    unit.selected_id = remaining[0].id if remaining else None
+            series.updated_at = time.time()
+            self._save_series_data_unlocked()
+            return series
+
+    def generate_series_asset_from_reference(
+        self,
+        series_id: str,
+        asset_id: str,
+        asset_type: str,
+        reference_image_path: str,
+        prompt: str,
+        negative_prompt: str = "",
+        strength: float = 0.62,
+        size: str = "768*1024",
+        mode: str = "img2img",
+        generation_type: str = "reference_sheet",
+    ) -> Series:
+        """Generate a styled variant from a user-supplied reference photo."""
+        from .models import GenerationStatus, ImageAsset, ImageVariant
+
+        with self._save_lock:
+            series, target = self._find_series_asset(series_id, asset_id, asset_type)
+            variant_id = str(uuid.uuid4())
+            subdir = {"character": "characters", "scene": "scenes", "prop": "props"}[
+                asset_type
+            ]
+            out_path = os.path.join(
+                "output", "assets", subdir, f"{asset_id}_refgen_{variant_id}.png"
+            )
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+            model = self.asset_generator._get_model_for(None)
+            model.generate(
+                prompt,
+                out_path,
+                ref_image_paths=[reference_image_path],
+                mode=mode,
+                strength=strength,
+                negative_prompt=negative_prompt,
+                size=size,
+            )
+
+            rel_path = os.path.relpath(out_path, "output")
+            variant = ImageVariant(id=variant_id, url=rel_path, prompt_used=prompt)
+            if asset_type != "character":
+                unit = target.image_asset
+                unit.variants.append(variant)
+                unit.selected_id = variant_id
+                target.image_url = rel_path
+            elif generation_type == "full_body":
+                if not target.full_body_asset:
+                    target.full_body_asset = ImageAsset()
+                target.full_body_asset.variants.append(variant)
+                target.full_body_asset.selected_id = variant_id
+                target.full_body_image_url = rel_path
+                target.image_url = rel_path
+            elif generation_type == "three_view":
+                if not target.three_view_asset:
+                    target.three_view_asset = ImageAsset()
+                target.three_view_asset.variants.append(variant)
+                target.three_view_asset.selected_id = variant_id
+                target.three_view_image_url = rel_path
+            elif generation_type == "headshot":
+                if not target.headshot_asset:
+                    target.headshot_asset = ImageAsset()
+                target.headshot_asset.variants.append(variant)
+                target.headshot_asset.selected_id = variant_id
+                target.headshot_image_url = rel_path
+            else:
+                unit = target.reference_sheet
+                unit.image_variants.append(variant)
+                unit.selected_image_id = variant_id
+                target.image_url = rel_path
+                target.avatar_url = rel_path
+            try:
+                target.status = GenerationStatus.COMPLETED
+            except Exception:
+                pass
+            series.updated_at = time.time()
+            self._save_series_data_unlocked()
+            return series
+
+    def update_series_asset_image(
+        self, series_id: str, asset_id: str, asset_type: str, image_url: str
+    ) -> Series:
         """Updates the image URL of a Series asset."""
         with self._save_lock:
-            series, target_asset = self._find_series_asset(series_id, asset_id, asset_type)
+            series, target_asset = self._find_series_asset(
+                series_id, asset_id, asset_type
+            )
             target_asset.image_url = image_url
             if asset_type == "character":
                 target_asset.avatar_url = image_url
             self._save_series_data_unlocked()
             return series
 
-    def update_series_asset_attributes(self, series_id: str, asset_id: str, asset_type: str, attributes: Dict[str, Any]) -> Series:
+    def update_series_asset_attributes(
+        self, series_id: str, asset_id: str, asset_type: str, attributes: Dict[str, Any]
+    ) -> Series:
         """Updates arbitrary attributes of a Series asset."""
         with self._save_lock:
-            series, target_asset = self._find_series_asset(series_id, asset_id, asset_type)
+            series, target_asset = self._find_series_asset(
+                series_id, asset_id, asset_type
+            )
             for key, value in attributes.items():
                 if hasattr(target_asset, key) and key not in ("id", "status", "locked"):
                     setattr(target_asset, key, value)
@@ -4760,12 +6267,21 @@ class ComicGenPipeline:
             self._save_series_data_unlocked()
             return series
 
-    def generate_series_asset(self, series_id: str, asset_id: str, asset_type: str,
-                              style_preset: str = None, reference_image_url: str = None,
-                              style_prompt: str = None, generation_type: str = "all",
-                              prompt: str = None, apply_style: bool = True,
-                              negative_prompt: str = None, batch_size: int = 1,
-                              model_name: str = None) -> tuple:
+    def generate_series_asset(
+        self,
+        series_id: str,
+        asset_id: str,
+        asset_type: str,
+        style_preset: str = None,
+        reference_image_url: str = None,
+        style_prompt: str = None,
+        generation_type: str = "all",
+        prompt: str = None,
+        apply_style: bool = True,
+        negative_prompt: str = None,
+        batch_size: int = 1,
+        model_name: str = None,
+    ) -> tuple:
         """Generate a Series asset. Creates an async task like project asset generation.
         Returns (series, task_id)."""
         series = self.series_store.get(series_id)
@@ -4775,6 +6291,7 @@ class ComicGenPipeline:
         t2i_model = model_name or series.model_settings.t2i_model
 
         from .assets import ASPECT_RATIO_TO_SIZE
+
         if asset_type == "character":
             aspect_ratio = series.model_settings.character_aspect_ratio
             default_size = "576*1024"
@@ -4796,10 +6313,16 @@ class ComicGenPipeline:
             resolved_art_dir = ArtDirection(**resolved_art_dir)
         if apply_style:
             if resolved_art_dir and resolved_art_dir.style_config:
-                effective_positive_prompt = resolved_art_dir.style_config.get('positive_prompt', '')
-                global_neg = resolved_art_dir.style_config.get('negative_prompt', '')
+                effective_positive_prompt = resolved_art_dir.style_config.get(
+                    "positive_prompt", ""
+                )
+                global_neg = resolved_art_dir.style_config.get("negative_prompt", "")
                 if global_neg:
-                    effective_negative_prompt = f"{effective_negative_prompt}, {global_neg}" if effective_negative_prompt else global_neg
+                    effective_negative_prompt = (
+                        f"{effective_negative_prompt}, {global_neg}"
+                        if effective_negative_prompt
+                        else global_neg
+                    )
             elif style_prompt:
                 effective_positive_prompt = style_prompt
             elif style_preset:
@@ -4826,11 +6349,13 @@ class ComicGenPipeline:
                 "batch_size": batch_size,
                 "t2i_model": t2i_model,
                 "effective_size": effective_size,
-            }
+            },
         }
         return series, task_id
 
-    def import_assets_from_series(self, target_series_id: str, source_series_id: str, asset_ids: List[str]) -> Tuple[Series, List[str], List[str]]:
+    def import_assets_from_series(
+        self, target_series_id: str, source_series_id: str, asset_ids: List[str]
+    ) -> Tuple[Series, List[str], List[str]]:
         """Deep-copy selected assets from source Series to target Series.
         Returns (target_series, imported_ids, skipped_ids)."""
         with self._save_lock:
@@ -4859,6 +6384,7 @@ class ComicGenPipeline:
                 asset_type, asset = source_assets[aid]
                 # Deep copy with new ID
                 import copy
+
                 new_asset = copy.deepcopy(asset)
                 new_asset.id = str(uuid.uuid4())
                 if asset_type == "character":
@@ -4873,12 +6399,27 @@ class ComicGenPipeline:
             self._save_series_data_unlocked()
             return target, imported_ids, skipped_ids
 
-    def get_effective_prompt(self, prompt_type: str, episode: Script, series: Optional[Series] = None) -> str:
+    def get_effective_prompt(
+        self, prompt_type: str, episode: Script, series: Optional[Series] = None
+    ) -> str:
         """Three-level fallback: Episode -> Series -> system default."""
-        valid_prompt_types = ("storyboard_polish", "video_polish", "r2v_polish", "storyboard_extraction")
+        valid_prompt_types = (
+            "storyboard_polish",
+            "video_polish",
+            "r2v_polish",
+            "storyboard_extraction",
+        )
         if prompt_type not in valid_prompt_types:
-            raise ValueError(f"Invalid prompt_type: {prompt_type}. Must be one of {valid_prompt_types}")
-        from .llm import DEFAULT_STORYBOARD_POLISH_PROMPT, DEFAULT_VIDEO_POLISH_PROMPT, DEFAULT_R2V_POLISH_PROMPT, DEFAULT_STORYBOARD_EXTRACTION_PROMPT
+            raise ValueError(
+                f"Invalid prompt_type: {prompt_type}. Must be one of {valid_prompt_types}"
+            )
+        from .llm import (
+            DEFAULT_STORYBOARD_POLISH_PROMPT,
+            DEFAULT_VIDEO_POLISH_PROMPT,
+            DEFAULT_R2V_POLISH_PROMPT,
+            DEFAULT_STORYBOARD_EXTRACTION_PROMPT,
+        )
+
         defaults = {
             "storyboard_polish": DEFAULT_STORYBOARD_POLISH_PROMPT,
             "video_polish": DEFAULT_VIDEO_POLISH_PROMPT,

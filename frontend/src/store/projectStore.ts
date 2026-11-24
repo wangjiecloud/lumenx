@@ -291,7 +291,7 @@ interface ProjectStore {
     // Entity extraction confirmation (persists across step switches)
     pendingExtraction: { characters: any[]; scenes: any[]; props: any[] } | null;
     pendingExtractionScript: string | null;
-    confirmExtraction: () => Promise<void>;
+    confirmExtraction: (preserveFrames?: boolean) => Promise<void>;
     discardExtraction: () => void;
 
     // Global Selection State
@@ -413,21 +413,46 @@ export const useProjectStore = create<ProjectStore>()(
             // Entity extraction confirmation
             pendingExtraction: null,
             pendingExtractionScript: null,
-            confirmExtraction: async () => {
+            confirmExtraction: async (preserveFrames = false) => {
                 const { currentProject, pendingExtractionScript } = get();
-                if (!currentProject?.id || !pendingExtractionScript) return;
+                if (!currentProject?.id || !pendingExtractionScript) {
+                    // Surface the failure instead of silently no-op'ing so the
+                    // modal never gets stuck with no feedback for the user.
+                    throw new Error("No pending extraction to apply");
+                }
                 set({ isAnalyzing: true });
                 try {
-                    const project = await api.reparseProject(currentProject.id, pendingExtractionScript);
+                    const reparsed = await api.reparseProject(
+                        currentProject.id,
+                        pendingExtractionScript,
+                        preserveFrames,
+                    );
+                    // Close the modal as soon as the reparse has actually been
+                    // persisted. If the follow-up refetch below fails we must
+                    // still dismiss the modal — otherwise the confirm button
+                    // looks unresponsive.
                     set((state) => ({
                         projects: state.projects.map((p) =>
-                            p.id === project.id ? { ...project, updatedAt: new Date().toISOString() } : p
+                            p.id === reparsed.id ? { ...reparsed, updatedAt: new Date().toISOString() } : p
                         ),
-                        currentProject: { ...project, updatedAt: new Date().toISOString() },
+                        currentProject: { ...reparsed, updatedAt: new Date().toISOString() },
                         pendingExtraction: null,
                         pendingExtractionScript: null,
                         isAnalyzing: false,
                     }));
+                    // Refetch the MERGED project (episode + series) so the asset
+                    // grid does not collapse to an empty episode-only list.
+                    try {
+                        const project = await api.getProject(currentProject.id);
+                        set((state) => ({
+                            projects: state.projects.map((p) =>
+                                p.id === project.id ? { ...project, updatedAt: new Date().toISOString() } : p
+                            ),
+                            currentProject: { ...project, updatedAt: new Date().toISOString() },
+                        }));
+                    } catch (refetchError) {
+                        console.warn("Applied extraction but failed to refetch merged project:", refetchError);
+                    }
                 } catch (error) {
                     console.error("Failed to apply extraction:", error);
                     set({ isAnalyzing: false });

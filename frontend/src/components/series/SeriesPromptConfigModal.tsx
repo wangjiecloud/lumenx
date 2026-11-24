@@ -41,11 +41,24 @@ export default function SeriesPromptConfigModal({ isOpen, onClose, seriesId, onS
     const t = useTranslations("series");
     const tc = useTranslations("common");
     const [config, setConfig] = useState({ storyboard_polish: '', video_polish: '', r2v_polish: '', polish_model: '' });
+    const [llmModels, setLlmModels] = useState<{ id: string; name: string }[]>([]);
     const [defaults, setDefaults] = useState<PromptDefaults | null>(null);
     const [expandedDefault, setExpandedDefault] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        api.getLlmModels()
+            .then((data) => {
+                if (cancelled) return;
+                setLlmModels(data.models || []);
+                setConfig((prev) => ({ ...prev, polish_model: prev.polish_model || data.default }));
+            })
+            .catch(() => { /* catalogue unavailable — keep backend default */ });
+        return () => { cancelled = true; };
+    }, []);
 
     useEffect(() => {
         if (isOpen && seriesId) {
@@ -145,14 +158,16 @@ export default function SeriesPromptConfigModal({ isOpen, onClose, seriesId, onS
                                         </p>
                                     </div>
                                     <select
-                                        value={config.polish_model || "qwen3.7-plus"}
+                                        value={config.polish_model || "deepseek-v4.1-flash"}
                                         onChange={(e) => setConfig(prev => ({ ...prev, polish_model: e.target.value }))}
                                         className="w-full bg-input-bg border border-glass-border rounded-lg px-3 py-2 text-sm text-text-secondary focus:outline-none focus:border-purple-500/50"
                                     >
-                                        <option value="qwen3.7-plus">qwen3.7-plus · 通义千问 3.7 Plus（最新）</option>
-                                        <option value="qwen3.6-plus">qwen3.6-plus · 通义千问 3.6 Plus（视觉）</option>
-                                        <option value="qwen3.6-flash">qwen3.6-flash · 通义千问 3.6 Flash（更快）</option>
-                                        <option value="kimi-k2.6">kimi-k2.6 · Moonshot Kimi K2.6（视觉）</option>
+                                        {llmModels.length === 0 && (
+                                            <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
+                                        )}
+                                        {llmModels.map((m) => (
+                                            <option key={m.id} value={m.id}>{m.name} ({m.id})</option>
+                                        ))}
                                     </select>
                                     <div className="border-b border-border-subtle pt-1" />
                                 </div>

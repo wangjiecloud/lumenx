@@ -5,6 +5,8 @@ import dynamic from "next/dynamic";
 import { motion, AnimatePresence } from "framer-motion";
 import { Image as ImageIcon, Play, ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
+import { useProjectStore } from "@/store/projectStore";
+import { toast } from "@/store/toastStore";
 import type { Series, Character, Scene, Prop, Project } from "@/store/projectStore";
 import AssetCard from "@/components/common/AssetCard";
 import { useTranslations } from "next-intl";
@@ -34,6 +36,7 @@ export default function SeriesDetailPage({ seriesId }: SeriesDetailPageProps) {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showPromptConfig, setShowPromptConfig] = useState(false);
   const [showImportAssets, setShowImportAssets] = useState(false);
+  const deleteSeries = useProjectStore((state) => state.deleteSeries);
 
   const t = useTranslations("series");
   const tc = useTranslations("common");
@@ -66,6 +69,18 @@ export default function SeriesDetailPage({ seriesId }: SeriesDetailPageProps) {
 
   const handleBackToHome = () => {
     window.location.hash = "";
+  };
+
+  const handleDeleteSeries = async () => {
+    if (!series) return;
+    if (!confirm(t("confirmDeleteSeries", { title: series.title }))) return;
+    try {
+      await deleteSeries(seriesId);
+      window.location.hash = "";
+    } catch (error) {
+      console.error("Failed to delete series:", error);
+      toast.error(t("deleteFailed"));
+    }
   };
 
   const handleTitleSave = async () => {
@@ -186,6 +201,7 @@ export default function SeriesDetailPage({ seriesId }: SeriesDetailPageProps) {
         onOpenModelSettings={() => setShowModelSettings(true)}
         onOpenPromptConfig={() => setShowPromptConfig(true)}
         onOpenImportAssets={() => setShowImportAssets(true)}
+        onDeleteSeries={handleDeleteSeries}
       />
 
       {/* ── Content Area ── */}

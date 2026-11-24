@@ -39,6 +39,8 @@ export default function StoryboardComposer() {
     const [insertIndex, setInsertIndex] = useState<number | null>(null);
     const [extractingFrameId, setExtractingFrameId] = useState<string | null>(null);
     const [showScriptOverlay, setShowScriptOverlay] = useState(false);
+    const [batchRendering, setBatchRendering] = useState(false);
+    const [batchProgress, setBatchProgress] = useState({ done: 0, total: 0 });
 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [uploadTargetFrameId, setUploadTargetFrameId] = useState<string | null>(null);
@@ -326,6 +328,32 @@ export default function StoryboardComposer() {
         }
     };
 
+    const handleRenderAll = async () => {
+        if (!currentProject || batchRendering) return;
+        const frames: any[] = currentProject.frames || [];
+        const targets = frames.filter(
+            (f: any) => !f.locked && !((f.rendered_image_asset?.variants?.length || 0) > 0) && !f.image_url,
+        );
+        if (targets.length === 0) {
+            alert("没有需要渲染的帧（都已渲染或已锁定）。");
+            return;
+        }
+        if (!confirm(`将渲染 ${targets.length} 帧，单帧较慢，确定继续？`)) return;
+        setBatchRendering(true);
+        try {
+            for (let i = 0; i < targets.length; i++) {
+                setBatchProgress({ done: i, total: targets.length });
+                await handleRenderFrame(targets[i], 1);
+                const updated = await api.getProject(currentProject.id);
+                updateProject(currentProject.id, updated);
+            }
+            setBatchProgress({ done: targets.length, total: targets.length });
+        } finally {
+            setBatchRendering(false);
+            setTimeout(() => setBatchProgress({ done: 0, total: 0 }), 3000);
+        }
+    };
+
     return (
         <div className="flex flex-col h-full text-foreground overflow-hidden">
             <StepHeader
@@ -360,6 +388,18 @@ export default function StoryboardComposer() {
                             title={t("generateFromScript")}
                         >
                             {isAnalyzing ? t("generatingFrames") : t("generateStoryboard")}
+                        </WorkflowActionButton>
+                        <WorkflowActionButton
+                            variant="secondary"
+                            size="sm"
+                            leftIcon={batchRendering ? <RefreshCw className="animate-spin" /> : <Wand2 />}
+                            onClick={handleRenderAll}
+                            disabled={batchRendering || isAnalyzing}
+                            title="渲染所有未渲染的帧"
+                        >
+                            {batchRendering
+                                ? `渲染中 ${batchProgress.done}/${batchProgress.total}`
+                                : "一键渲染全部"}
                         </WorkflowActionButton>
                     </div>
                 )}
@@ -681,7 +721,7 @@ function CreateFrameDialog({ onClose, onCreate, scenes }: { onClose: () => void;
                 <div className="p-6 border-b border-glass-border flex justify-between items-center bg-surface">
                     <div className="flex items-center gap-3">
                         <Plus className="text-primary" size={20} />
-                        <h2 className="text-lg font-bold text-foreground">Add New Frame</h2>
+                        <h2 className="text-lg font-bold text-foreground">添加分镜</h2>
                     </div>
                     <button onClick={onClose} className="p-2 hover:bg-hover-bg rounded-lg transition-colors">
                         <X size={20} className="text-text-secondary" />
@@ -690,13 +730,13 @@ function CreateFrameDialog({ onClose, onCreate, scenes }: { onClose: () => void;
 
                 <div className="p-6 space-y-4">
                     <div>
-                        <label className="block text-sm font-medium text-text-secondary mb-2">Scene</label>
+                        <label className="block text-sm font-medium text-text-secondary mb-2">场景</label>
                         <select
                             value={sceneId}
                             onChange={(e) => setSceneId(e.target.value)}
                             className="w-full px-4 py-3 bg-input-bg border border-glass-border rounded-lg text-foreground focus:border-primary/50 focus:outline-none appearance-none"
                         >
-                            <option value="" disabled>Select a scene</option>
+                            <option value="" disabled>选择场景</option>
                             {scenes.map((s: any) => (
                                 <option key={s.id} value={s.id}>{s.name}</option>
                             ))}
@@ -800,7 +840,7 @@ function ImageWithRetry({ src, alt, className, onClick }: { src: string, alt: st
             />
             {error && retryCount >= 10 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-500/10 backdrop-blur-sm z-20 p-2 text-center">
-                    <span className="text-xs text-red-400 font-bold">Failed to load</span>
+                    <span className="text-xs text-red-400 font-bold">加载失败</span>
                     <span className="text-[0.625rem] text-red-400/70 break-all">{src}</span>
                 </div>
             )}

@@ -8,6 +8,7 @@ import { useProjectStore } from "@/store/projectStore";
 import { api, type BgmPreset } from "@/lib/api";
 import { getAssetUrl, extractErrorDetail } from "@/lib/utils";
 import StepPageHeader, { StepPill } from "@/components/shared/StepPageHeader";
+import StepGuide from "@/components/shared/StepGuide";
 import SidePanelHeader from "@/components/shared/SidePanelHeader";
 
 type AssemblyPhase = "takes" | "mix" | "export";
@@ -21,6 +22,7 @@ export default function VideoAssembly() {
     const [phase, setPhase] = useState<AssemblyPhase>("takes");
     const [selectedFrameId, setSelectedFrameId] = useState<string | null>(null);
     const [isMerging, setIsMerging] = useState(false);
+    const [isAssembling, setIsAssembling] = useState(false);
     const [mergeError, setMergeError] = useState<string | null>(null);
     const [isDownloading, setIsDownloading] = useState(false);
 
@@ -47,6 +49,22 @@ export default function VideoAssembly() {
             updateProject(currentProject.id, updatedProject);
         } catch (error) {
             console.error("Failed to select video:", error);
+        }
+    };
+
+    const handleAssembleNarration = async () => {
+        if (!currentProject) return;
+        if (!confirm("将拼接片段并生成配音+字幕（耗时数分钟），确定？")) return;
+        setIsAssembling(true);
+        try {
+            const res = await api.assembleNarration(currentProject.id);
+            alert("合成完成：" + res.url);
+            const updated = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, updated);
+        } catch (error: any) {
+            alert(error?.response?.data?.detail || error?.message || "合成失败");
+        } finally {
+            setIsAssembling(false);
         }
     };
 
@@ -131,6 +149,13 @@ export default function VideoAssembly() {
                             <StepPill label={ta("framesReadyLabel")} value={`${framesReady}/${framesTotal}`} />
                         </>
                     ) : null}
+                />
+                <StepGuide
+                    steps={[
+                        "拖动调整片段顺序、裁剪时长。",
+                        "生成或绑定配音，逐句检查对白。",
+                        "点「导出」渲染最终 mp4 视频。",
+                    ]}
                 />
                 {/* PR-3k · Phase tabs — Takes / Mix / Export */}
                 <div className="flex items-center gap-1 px-6 pt-2 border-b border-glass-border bg-surface">
@@ -278,6 +303,8 @@ export default function VideoAssembly() {
                             framesReady={framesReady}
                             framesTotal={framesTotal}
                             onMerge={handleMerge}
+                            onAssemble={handleAssembleNarration}
+                            isAssembling={isAssembling}
                             onDownload={handleDownload}
                             onDismissError={() => setMergeError(null)}
                         />
@@ -521,6 +548,8 @@ function ExportPhase({
     framesReady,
     framesTotal,
     onMerge,
+    onAssemble,
+    isAssembling,
     onDownload,
     onDismissError,
 }: {
@@ -531,6 +560,8 @@ function ExportPhase({
     framesReady: number;
     framesTotal: number;
     onMerge: () => void;
+    onAssemble: () => void;
+    isAssembling: boolean;
     onDownload: () => void;
     onDismissError: () => void;
 }) {
@@ -549,14 +580,24 @@ function ExportPhase({
                             {ta("exportSubtitle", { ready: framesReady, total: framesTotal })}
                         </p>
                     </div>
-                    <button
-                        onClick={onMerge}
-                        disabled={isMerging || !allReady}
-                        className="shrink-0 inline-flex items-center gap-2 bg-primary text-white border border-[rgba(100,108,255,0.65)] shadow-[inset_0_1.5px_0_rgba(255,255,255,0.14)] hover:bg-primary-hover disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-md font-semibold text-[0.8125rem]"
-                    >
-                        {isMerging ? <Loader2 size={14} className="animate-spin" /> : <Film size={14} />}
-                        {ta("mergeAndProceed")}
-                    </button>
+                    <div className="shrink-0 flex items-center gap-2">
+                        <button
+                            onClick={onMerge}
+                            disabled={isMerging || !allReady}
+                            className="inline-flex items-center gap-2 bg-primary text-white border border-[rgba(100,108,255,0.65)] shadow-[inset_0_1.5px_0_rgba(255,255,255,0.14)] hover:bg-primary-hover disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-md font-semibold text-[0.8125rem]"
+                        >
+                            {isMerging ? <Loader2 size={14} className="animate-spin" /> : <Film size={14} />}
+                            {ta("mergeAndProceed")}
+                        </button>
+                        <button
+                            onClick={onAssemble}
+                            disabled={isAssembling || !allReady}
+                            className="inline-flex items-center gap-2 bg-glass text-foreground border border-glass-border hover:bg-hover-bg disabled:opacity-40 disabled:cursor-not-allowed px-5 py-2.5 rounded-md font-semibold text-[0.8125rem]"
+                        >
+                            {isAssembling ? <Loader2 size={14} className="animate-spin" /> : <Music size={14} />}
+                            配音+字幕合成
+                        </button>
+                    </div>
                 </div>
             </section>
 

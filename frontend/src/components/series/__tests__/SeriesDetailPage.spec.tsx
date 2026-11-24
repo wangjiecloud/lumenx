@@ -36,6 +36,8 @@ vi.mock('lucide-react', () => ({
     ChevronLeft: (props: any) => <span data-testid="icon-chevron-left" {...props} />,
     ChevronRight: (props: any) => <span data-testid="icon-chevron-right" {...props} />,
     Play: (props: any) => <span data-testid="icon-play" {...props} />,
+    Palette: (props: any) => <span data-testid="icon-palette" {...props} />,
+    Trash2: (props: any) => <span data-testid="icon-trash-2" {...props} />,
 }));
 
 // Mock AssetCard

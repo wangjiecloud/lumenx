@@ -286,7 +286,7 @@ export default function EnvConfigDialog({ isOpen, onClose, isRequired = false }:
                   <div className="space-y-4">
                     <div>
                       <label className="flex items-center justify-between text-sm font-medium text-foreground mb-2">
-                        <span>OSS Bucket Name</span>
+                        <span>OSS 存储桶名称</span>
                         <span className="text-text-muted font-normal text-xs">e.g. my-comic-bucket</span>
                       </label>
                       <input
@@ -300,7 +300,7 @@ export default function EnvConfigDialog({ isOpen, onClose, isRequired = false }:
 
                     <div>
                       <label className="flex items-center justify-between text-sm font-medium text-foreground mb-2">
-                        <span>OSS Endpoint</span>
+                        <span>OSS 访问端点</span>
                         <span className="text-text-muted font-normal text-xs">e.g. oss-cn-hangzhou.aliyuncs.com</span>
                       </label>
                       <input
@@ -314,7 +314,7 @@ export default function EnvConfigDialog({ isOpen, onClose, isRequired = false }:
 
                     <div>
                       <label className="flex items-center justify-between text-sm font-medium text-foreground mb-2">
-                        <span>OSS Base Path</span>
+                        <span>OSS 基础路径</span>
                         <span className="text-text-muted font-normal text-xs">e.g. lumenx</span>
                       </label>
                       <input
@@ -330,7 +330,7 @@ export default function EnvConfigDialog({ isOpen, onClose, isRequired = false }:
 
                 <div className="pt-4 border-t border-glass-border">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-sm font-bold text-foreground">Kling Provider</h3>
+                    <h3 className="text-sm font-bold text-foreground">Kling 接入方式</h3>
                     <span className="text-[0.625rem] text-text-muted">{t("chooseProvider")}</span>
                   </div>
                   <div className="bg-glass border border-glass-border rounded-lg p-4 space-y-4">
@@ -388,7 +388,7 @@ export default function EnvConfigDialog({ isOpen, onClose, isRequired = false }:
 
                 <div className="pt-4 border-t border-glass-border">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-sm font-bold text-foreground">Vidu Provider</h3>
+                    <h3 className="text-sm font-bold text-foreground">Vidu 接入方式</h3>
                     <span className="text-[0.625rem] text-text-muted">{t("chooseProvider")}</span>
                   </div>
                   <div className="bg-input-bg border border-glass-border rounded-lg p-4 space-y-4">

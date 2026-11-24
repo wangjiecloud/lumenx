@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from "react";
 import { Save, Loader2, ChevronDown, ChevronRight, FolderOpen, WifiOff, Copy, Check } from "lucide-react";
 import { useTranslations } from "next-intl";
-import { api, type EnvConfigPayload, type ProviderMode, API_URL } from "@/lib/api";
+import { api, type EnvConfigPayload, type ProviderMode, type LlmModelOption, API_URL } from "@/lib/api";
 import { ASPECT_RATIOS } from "@/store/projectStore";
 import {
   DEFAULT_MODEL_SETTINGS,
@@ -48,6 +48,8 @@ type EnvConfig = EnvConfigPayload & {
   VIDU_API_KEY: string;
   MULEROUTER_API_KEY: string;
   MULERUN_CLI_LOGGED_IN?: boolean;
+  LLM_PROVIDER?: string;
+  LITELLM_MODEL: string;
   endpoint_overrides: Record<string, string>;
 };
 
@@ -73,6 +75,7 @@ const DEFAULT_CONFIG: EnvConfig = {
   KLING_SECRET_KEY: "",
   VIDU_API_KEY: "",
   MULEROUTER_API_KEY: "",
+  LITELLM_MODEL: "",
   endpoint_overrides: {},
 };
 
@@ -89,7 +92,13 @@ const normalizeEnvConfig = (existing: EnvConfig, data?: EnvConfigPayload): EnvCo
 
 const getValidationErrors = (env: EnvConfig): string[] => {
   const errors: string[] = [];
-  if (!env.DASHSCOPE_API_KEY?.trim()) errors.push("DashScope API Key");
+  // LiteLLM proxy + local models means no DashScope key is required.
+  const dashscopeNeeded =
+    env.LLM_PROVIDER !== "litellm" ||
+    env.IMAGE_BACKEND === "dashscope" ||
+    env.VIDEO_BACKEND === "dashscope" ||
+    env.TTS_BACKEND === "dashscope";
+  if (dashscopeNeeded && !env.DASHSCOPE_API_KEY?.trim()) errors.push("DashScope API Key");
   if (env.KLING_PROVIDER_MODE === "vendor") {
     if (!env.KLING_ACCESS_KEY?.trim()) errors.push("Kling Access Key (vendor mode)");
     if (!env.KLING_SECRET_KEY?.trim()) errors.push("Kling Secret Key (vendor mode)");
@@ -218,6 +227,27 @@ export default function SettingsPage() {
   const [systemLoading, setSystemLoading] = useState(false);
   const [systemChecked, setSystemChecked] = useState(false);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const [llmModels, setLlmModels] = useState<LlmModelOption[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await api.getLlmModels();
+        if (cancelled) return;
+        setLlmModels(data.models || []);
+        setConfig((prev) => ({
+          ...prev,
+          LITELLM_MODEL: prev.LITELLM_MODEL || data.default,
+        }));
+      } catch {
+        /* catalogue unavailable — fall back to backend default */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
@@ -677,8 +707,37 @@ export default function SettingsPage() {
         </div>
       ) : (
         <div className="space-y-1">
+          <FormRow label="LLM 模型" hint="通过 LiteLLM 代理调用；默认 deepseek-v4.1-flash。所选模型会用于剧本分析与提示词润色。">
+            <div className="space-y-1.5">
+              <div className="text-[0.625rem] text-text-muted">
+                Provider: <span className="font-mono text-foreground">{config.LLM_PROVIDER || "litellm"}</span>
+              </div>
+              <select
+                value={config.LITELLM_MODEL || "deepseek-v4.1-flash"}
+                onChange={(e) => handleChange("LITELLM_MODEL", e.target.value)}
+                className={settingsInputClass}
+              >
+                {llmModels.length === 0 && (
+                  <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
+                )}
+                {llmModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name} ({m.id})
+                  </option>
+                ))}
+              </select>
+            </div>
+          </FormRow>
+
           <FormRow label={t("dashscopeKeyLabel")} hint={t("dashscopeKeyHint")}>
-            <FieldLabel>DASHSCOPE_API_KEY *</FieldLabel>
+            <FieldLabel>
+              {config.LLM_PROVIDER !== "litellm" ||
+              config.IMAGE_BACKEND === "dashscope" ||
+              config.VIDEO_BACKEND === "dashscope" ||
+              config.TTS_BACKEND === "dashscope"
+                ? "DASHSCOPE_API_KEY *"
+                : "DASHSCOPE_API_KEY（本地/代理模式下可选）"}
+            </FieldLabel>
             <KeyField
               value={config.DASHSCOPE_API_KEY}
               onChange={(v) => handleChange("DASHSCOPE_API_KEY", v)}

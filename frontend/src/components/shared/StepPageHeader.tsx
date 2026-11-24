@@ -11,6 +11,7 @@
  * Mock ref: docs/design/tasty-sam/storyboard-r2v-unified.html `.wb-head`.
  */
 import type { ReactNode } from "react";
+import { localizeStepName } from "@/lib/stepNames";
 
 export interface StepPageHeaderProps {
     /** 1-based step number; rendered as the primary-colored eyebrow numeral. */
@@ -41,11 +42,12 @@ export default function StepPageHeader({
         <header className="shrink-0 border-b border-border-subtle px-7 pt-[22px] pb-4">
             <div className="flex items-start gap-5">
                 <div className="flex-1 min-w-0">
-                    <div className="font-mono text-[0.59375rem] font-normal uppercase tracking-[0.22em] text-text-muted">
-                        <span>STEP</span>
-                        <span className="ml-1.5 font-medium text-primary">{stepStr}</span>
+                    <div className="font-mono text-[0.59375rem] font-normal tracking-[0.22em] text-text-muted">
+                        <span>第</span>
+                        <span className="mx-1 font-medium text-primary">{stepNumber}</span>
+                        <span>步</span>
                         <span className="mx-1.5">·</span>
-                        <span>{englishName}</span>
+                        <span>{localizeStepName(englishName)}</span>
                     </div>
                     <div className="mt-1.5 flex flex-wrap items-baseline gap-3.5">
                         <h1 className="font-display text-[2.125rem] font-semibold leading-[1.05] tracking-[-0.02em] text-foreground">

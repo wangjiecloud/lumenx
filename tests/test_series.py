@@ -10,24 +10,36 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from src.apps.comic_gen.models import (
-    Series, Script, Character, Scene, Prop, PromptConfig, ModelSettings,
+    Series,
+    Script,
+    Character,
+    Scene,
+    Prop,
+    PromptConfig,
+    ModelSettings,
 )
-from src.apps.comic_gen.pipeline import ComicGenPipeline
+from src.apps.comic_gen.pipeline import (
+    ComicGenPipeline,
+    DuplicateSeriesTitleError,
+)
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def pipeline(tmp_path):
     """Create a pipeline with temp data files, bypassing real IO."""
-    with patch("src.apps.comic_gen.pipeline.ScriptProcessor"), \
-         patch("src.apps.comic_gen.pipeline.AssetGenerator"), \
-         patch("src.apps.comic_gen.pipeline.StoryboardGenerator"), \
-         patch("src.apps.comic_gen.pipeline.VideoGenerator"), \
-         patch("src.apps.comic_gen.pipeline.AudioGenerator"), \
-         patch("src.apps.comic_gen.pipeline.ExportManager"):
+    with (
+        patch("src.apps.comic_gen.pipeline.ScriptProcessor"),
+        patch("src.apps.comic_gen.pipeline.AssetGenerator"),
+        patch("src.apps.comic_gen.pipeline.StoryboardGenerator"),
+        patch("src.apps.comic_gen.pipeline.VideoGenerator"),
+        patch("src.apps.comic_gen.pipeline.AudioGenerator"),
+        patch("src.apps.comic_gen.pipeline.ExportManager"),
+    ):
         p = ComicGenPipeline()
     p.data_file = str(tmp_path / "projects.json")
     p.series_data_file = str(tmp_path / "series.json")
@@ -51,23 +63,36 @@ def _make_script(title="Episode 1", text="Some text", **overrides) -> Script:
 
 
 def _make_character(name="Hero", **kw) -> Character:
-    return Character(id=kw.pop("id", str(uuid.uuid4())), name=name,
-                     description=kw.pop("description", "A brave hero"), **kw)
+    return Character(
+        id=kw.pop("id", str(uuid.uuid4())),
+        name=name,
+        description=kw.pop("description", "A brave hero"),
+        **kw,
+    )
 
 
 def _make_scene(name="Forest", **kw) -> Scene:
-    return Scene(id=kw.pop("id", str(uuid.uuid4())), name=name,
-                 description=kw.pop("description", "A dark forest"), **kw)
+    return Scene(
+        id=kw.pop("id", str(uuid.uuid4())),
+        name=name,
+        description=kw.pop("description", "A dark forest"),
+        **kw,
+    )
 
 
 def _make_prop(name="Sword", **kw) -> Prop:
-    return Prop(id=kw.pop("id", str(uuid.uuid4())), name=name,
-                description=kw.pop("description", "A magic sword"), **kw)
+    return Prop(
+        id=kw.pop("id", str(uuid.uuid4())),
+        name=name,
+        description=kw.pop("description", "A magic sword"),
+        **kw,
+    )
 
 
 # ===================================================================
 # 1. Models tests
 # ===================================================================
+
 
 class TestModels:
     def test_series_defaults(self):
@@ -96,6 +121,7 @@ class TestModels:
 # 2. Pipeline CRUD tests
 # ===================================================================
 
+
 class TestSeriesCRUD:
     def test_create_series(self, pipeline):
         s = pipeline.create_series("Title A", "desc A")
@@ -123,7 +149,9 @@ class TestSeriesCRUD:
     def test_update_series_title_and_description(self, pipeline):
         s = pipeline.create_series("Old")
         old_updated = s.updated_at
-        updated = pipeline.update_series(s.id, {"title": "New", "description": "new desc"})
+        updated = pipeline.update_series(
+            s.id, {"title": "New", "description": "new desc"}
+        )
         assert updated.title == "New"
         assert updated.description == "new desc"
         assert updated.updated_at >= old_updated
@@ -137,6 +165,27 @@ class TestSeriesCRUD:
     def test_update_series_not_found(self, pipeline):
         with pytest.raises(ValueError, match="Series not found"):
             pipeline.update_series("missing", {"title": "X"})
+
+    def test_create_series_rejects_duplicate_title(self, pipeline):
+        pipeline.create_series("凡人修仙传")
+        with pytest.raises(DuplicateSeriesTitleError):
+            pipeline.create_series("凡人修仙传")
+
+    def test_create_series_duplicate_is_trimmed_and_case_insensitive(self, pipeline):
+        pipeline.create_series("My Series")
+        with pytest.raises(DuplicateSeriesTitleError):
+            pipeline.create_series("  my series  ")
+
+    def test_update_series_rejects_duplicate_title(self, pipeline):
+        pipeline.create_series("First")
+        second = pipeline.create_series("Second")
+        with pytest.raises(DuplicateSeriesTitleError):
+            pipeline.update_series(second.id, {"title": "first"})
+
+    def test_update_series_allows_same_title_on_itself(self, pipeline):
+        s = pipeline.create_series("Keep Me")
+        updated = pipeline.update_series(s.id, {"title": "Keep Me"})
+        assert updated.title == "Keep Me"
 
     def test_delete_series_clears_episodes(self, pipeline):
         s = pipeline.create_series("ToDelete")
@@ -154,10 +203,26 @@ class TestSeriesCRUD:
         with pytest.raises(ValueError, match="Series not found"):
             pipeline.delete_series("missing")
 
+    def test_repair_drops_dangling_episode_ids(self, pipeline):
+        s = pipeline.create_series("With Orphans")
+        s.episode_ids = ["missing-episode"]
+        pipeline._repair_series_bindings()
+        assert s.episode_ids == []
+
+    def test_repair_clears_episode_pointing_at_missing_series(self, pipeline):
+        ep = _make_script()
+        ep.series_id = "ghost-series"
+        ep.episode_number = 3
+        pipeline.scripts[ep.id] = ep
+        pipeline._repair_series_bindings()
+        assert ep.series_id is None
+        assert ep.episode_number is None
+
 
 # ===================================================================
 # 3. Episode association tests
 # ===================================================================
+
 
 class TestEpisodeAssociation:
     def test_add_episode_to_series(self, pipeline):
@@ -215,6 +280,7 @@ class TestEpisodeAssociation:
 # 4. Asset resolution tests
 # ===================================================================
 
+
 class TestResolveEpisodeAssets:
     def test_no_series_returns_local(self, pipeline):
         ep = _make_script()
@@ -230,10 +296,18 @@ class TestResolveEpisodeAssets:
         series_char = _make_character(name="Series Hero", id=shared_id)
         series_scene = _make_scene(name="Series Forest", id="series-scene")
         now = time.time()
-        series = Series(id="s1", title="S", characters=[series_char], scenes=[series_scene],
-                        created_at=now, updated_at=now)
+        series = Series(
+            id="s1",
+            title="S",
+            characters=[series_char],
+            scenes=[series_scene],
+            created_at=now,
+            updated_at=now,
+        )
 
-        ep_char = _make_character(name="Episode Hero", id=shared_id)  # same ID → local wins
+        ep_char = _make_character(
+            name="Episode Hero", id=shared_id
+        )  # same ID → local wins
         ep = _make_script(characters=[ep_char])
 
         result = pipeline.resolve_episode_assets(ep, series=series)
@@ -261,14 +335,19 @@ class TestResolveEpisodeAssets:
 # 5. PromptConfig three-level fallback tests
 # ===================================================================
 
+
 class TestGetEffectivePrompt:
     def test_episode_custom_takes_priority(self, pipeline):
         ep = _make_script()
         ep.prompt_config = PromptConfig(storyboard_polish="EP custom prompt")
         now = time.time()
-        series = Series(id="s1", title="S",
-                        prompt_config=PromptConfig(storyboard_polish="Series prompt"),
-                        created_at=now, updated_at=now)
+        series = Series(
+            id="s1",
+            title="S",
+            prompt_config=PromptConfig(storyboard_polish="Series prompt"),
+            created_at=now,
+            updated_at=now,
+        )
 
         result = pipeline.get_effective_prompt("storyboard_polish", ep, series)
         assert result == "EP custom prompt"
@@ -277,9 +356,13 @@ class TestGetEffectivePrompt:
         ep = _make_script()
         ep.prompt_config = PromptConfig(storyboard_polish="")
         now = time.time()
-        series = Series(id="s1", title="S",
-                        prompt_config=PromptConfig(storyboard_polish="Series prompt"),
-                        created_at=now, updated_at=now)
+        series = Series(
+            id="s1",
+            title="S",
+            prompt_config=PromptConfig(storyboard_polish="Series prompt"),
+            created_at=now,
+            updated_at=now,
+        )
 
         result = pipeline.get_effective_prompt("storyboard_polish", ep, series)
         assert result == "Series prompt"
@@ -288,8 +371,13 @@ class TestGetEffectivePrompt:
         ep = _make_script()
         ep.prompt_config = PromptConfig()
         now = time.time()
-        series = Series(id="s1", title="S", prompt_config=PromptConfig(),
-                        created_at=now, updated_at=now)
+        series = Series(
+            id="s1",
+            title="S",
+            prompt_config=PromptConfig(),
+            created_at=now,
+            updated_at=now,
+        )
 
         result = pipeline.get_effective_prompt("storyboard_polish", ep, series)
         # Should return the DEFAULT_STORYBOARD_POLISH_PROMPT (non-empty string)
@@ -305,6 +393,7 @@ class TestGetEffectivePrompt:
 # ===================================================================
 # 6. Text splitting tests
 # ===================================================================
+
 
 class TestSplitTextByMarkers:
     def test_normal_marker_split(self, pipeline):
@@ -349,6 +438,7 @@ class TestSplitTextByMarkers:
 # 7. Cross-series import tests
 # ===================================================================
 
+
 class TestImportAssetsFromSeries:
     def test_deep_copy_with_new_id(self, pipeline):
         source = pipeline.create_series("Source")
@@ -358,7 +448,9 @@ class TestImportAssetsFromSeries:
 
         target = pipeline.create_series("Target")
 
-        result, imported_ids, skipped_ids = pipeline.import_assets_from_series(target.id, source.id, [original_id])
+        result, imported_ids, skipped_ids = pipeline.import_assets_from_series(
+            target.id, source.id, [original_id]
+        )
         assert len(result.characters) == 1
         imported = result.characters[0]
         # New ID, same name
@@ -372,7 +464,9 @@ class TestImportAssetsFromSeries:
         source.characters = [_make_character(name="Hero")]
         target = pipeline.create_series("Target")
 
-        result, imported_ids, skipped_ids = pipeline.import_assets_from_series(target.id, source.id, ["nonexistent-id"])
+        result, imported_ids, skipped_ids = pipeline.import_assets_from_series(
+            target.id, source.id, ["nonexistent-id"]
+        )
         assert len(result.characters) == 0
         assert len(result.scenes) == 0
         assert len(result.props) == 0

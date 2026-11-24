@@ -2,19 +2,22 @@
 
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
-import { Video } from "lucide-react";
+import { Video, Sparkles, RefreshCw } from "lucide-react";
 import { useProjectStore } from "@/store/projectStore";
 import VideoCreator from "./VideoCreator";
 import VideoSidebar from "./VideoSidebar";
 import { api, VideoTask } from "@/lib/api";
 import { resolveModelId } from "@/lib/modelCatalog";
 import StepHeader from "@/components/shared/StepHeader";
+import StepGuide from "@/components/shared/StepGuide";
+import WorkflowActionButton from "@/components/shared/WorkflowActionButton";
 
 export default function VideoGenerator() {
     const tStep = useTranslations("stepHeader");
     const currentProject = useProjectStore((state) => state.currentProject);
     const updateProject = useProjectStore((state) => state.updateProject);
     const [tasks, setTasks] = useState<VideoTask[]>([]);
+    const [autoRunning, setAutoRunning] = useState(false);
 
     // Shared state for Remix functionality
     const [remixData, setRemixData] = useState<Partial<VideoTask> | null>(null);
@@ -124,6 +127,22 @@ export default function VideoGenerator() {
         }));
     };
 
+    const handleAutoMotion = async () => {
+        if (!currentProject || autoRunning) return;
+        if (!confirm("将把已渲染的分镜按镜头做成 4 秒动效漫画片段（静帧运镜，不调用视频模型），确定继续？")) return;
+        setAutoRunning(true);
+        try {
+            const res = await api.motionComic(currentProject.id);
+            alert(`已生成 ${res.count} 段动效漫画片段（可在右侧查看/预览）。`);
+            const project = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, project);
+        } catch (error: any) {
+            alert(error?.response?.data?.detail || error?.message || "自动生成失败");
+        } finally {
+            setAutoRunning(false);
+        }
+    };
+
     const queueCount = tasks.filter(t => t.status === "pending" || t.status === "processing").length;
     const doneCount = tasks.filter(t => t.status === "completed").length;
 
@@ -136,26 +155,48 @@ export default function VideoGenerator() {
                 englishName="Motion Generator"
                 title={tStep("motionTitle")}
                 subtitle={tStep("motionSubtitle")}
-                trailing={tasks.length > 0 ? (
-                    <span className="font-mono text-[0.625rem] uppercase tracking-[0.18em] text-text-muted">
-                        <span className="text-foreground font-medium">{tasks.length}</span>
-                        <span className="ml-1.5">shots</span>
-                        {doneCount > 0 ? (
-                            <>
-                                <span className="mx-1.5 text-text-muted/40">·</span>
-                                <span className="text-primary">{doneCount}</span>
-                                <span className="ml-1.5">done</span>
-                            </>
+                trailing={
+                    <div className="flex items-center gap-3">
+                        <WorkflowActionButton
+                            variant="primary"
+                            size="sm"
+                            leftIcon={autoRunning ? <RefreshCw className="animate-spin" /> : <Sparkles />}
+                            onClick={handleAutoMotion}
+                            disabled={autoRunning}
+                            title="按镜头分组，用静帧运镜生成动效片段"
+                        >
+                            {autoRunning ? "生成中…" : "自动生成动效漫画"}
+                        </WorkflowActionButton>
+                        {tasks.length > 0 ? (
+                            <span className="font-mono text-[0.625rem] uppercase tracking-[0.18em] text-text-muted">
+                                <span className="text-foreground font-medium">{tasks.length}</span>
+                                <span className="ml-1.5">shots</span>
+                                {doneCount > 0 ? (
+                                    <>
+                                        <span className="mx-1.5 text-text-muted/40">·</span>
+                                        <span className="text-primary">{doneCount}</span>
+                                        <span className="ml-1.5">done</span>
+                                    </>
+                                ) : null}
+                                {queueCount > 0 ? (
+                                    <>
+                                        <span className="mx-1.5 text-text-muted/40">·</span>
+                                        <span className="text-foreground">{queueCount}</span>
+                                        <span className="ml-1.5">in queue</span>
+                                    </>
+                                ) : null}
+                            </span>
                         ) : null}
-                        {queueCount > 0 ? (
-                            <>
-                                <span className="mx-1.5 text-text-muted/40">·</span>
-                                <span className="text-foreground">{queueCount}</span>
-                                <span className="ml-1.5">in queue</span>
-                            </>
-                        ) : null}
-                    </span>
-                ) : undefined}
+                    </div>
+                }
+            />
+            <StepGuide
+                steps={[
+                    "点「自动生成动效漫画」：按镜头分组，用静帧做推拉/平移片段（不调用视频模型）。",
+                    "点生成视频片段（本地 LTX，单段约 2–5 分钟）。",
+                    "播放检查，不满意可重新生成。",
+                    "完成后进入「6. 合成」。",
+                ]}
             />
             <div className="flex flex-1 overflow-hidden">
                 {/* Left: Creator (70%) */}

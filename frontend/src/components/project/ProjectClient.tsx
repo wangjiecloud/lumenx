@@ -33,12 +33,12 @@ const CreativeCanvas = dynamic(() => import("@/components/canvas/CreativeCanvas"
 //   - Export → Assembly Export phase tab (PR-3k)
 // Both legacy and unified projects now share the 6-step shape.
 const LEGACY_STEPS = [
-    { id: "script", label: "1. Script", icon: BookOpen },
-    { id: "art_direction", label: "2. Art Direction", icon: Palette },
-    { id: "assets", label: "3. Assets", icon: Users },
-    { id: "storyboard", label: "4. Storyboard", icon: Layout },
-    { id: "motion", label: "5. Motion", icon: Video },
-    { id: "assembly", label: "6. Assembly", icon: Film },
+    { id: "script", label: "1. 脚本", icon: BookOpen },
+    { id: "art_direction", label: "2. 风格定调", icon: Palette },
+    { id: "assets", label: "3. 资产库", icon: Users },
+    { id: "storyboard", label: "4. 分镜", icon: Layout },
+    { id: "motion", label: "5. 动效生成", icon: Video },
+    { id: "assembly", label: "6. 合成", icon: Film },
 ];
 
 // PR-3f (r2v-workflow-v3) — Unified workflow: 5 steps including Cast.
@@ -48,14 +48,14 @@ const LEGACY_STEPS = [
 // Legacy `assets` step is dropped — Cast supersedes ConsistencyVault
 // for unified projects (ConsistencyVault stays only for legacy workflow).
 const UNIFIED_STEPS = [
-    { id: "script", label: "1. Script", icon: BookOpen },
-    { id: "art_direction", label: "2. Art Direction", icon: Palette },
-    { id: "cast", label: "3. Cast", icon: Users },
-    { id: "storyboard_r2v", label: "4. Storyboard", icon: Clapperboard },
-    { id: "assembly", label: "5. Assembly", icon: Film },
+    { id: "script", label: "1. 脚本", icon: BookOpen },
+    { id: "art_direction", label: "2. 风格定调", icon: Palette },
+    { id: "cast", label: "3. 本集素材", icon: Users },
+    { id: "storyboard_r2v", label: "4. 分镜", icon: Clapperboard },
+    { id: "assembly", label: "5. 合成", icon: Film },
 ];
 
-export default function ProjectClient({ id, breadcrumbSegments }: { id: string; breadcrumbSegments?: BreadcrumbSegment[] }) {
+export default function ProjectClient({ id, breadcrumbSegments, seriesId }: { id: string; breadcrumbSegments?: BreadcrumbSegment[]; seriesId?: string }) {
     const [activeStep, setActiveStep] = useState("script");
     const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
     const [envDialogOpen, setEnvDialogOpen] = useState(false);
@@ -139,8 +139,8 @@ export default function ProjectClient({ id, breadcrumbSegments }: { id: string; 
         return base.map(s => ({ ...s, ...statusFor(s.id) }));
     }, [currentProject, seriesContentMode, tp]);
 
-    const handleBackToHome = () => {
-        window.location.hash = '';
+    const handleBackFromNotFound = () => {
+        window.location.hash = seriesId ? `#/series/${seriesId}` : '';
     };
 
     // Cross-module step navigation event (used by intra-module
@@ -167,12 +167,14 @@ export default function ProjectClient({ id, breadcrumbSegments }: { id: string; 
         return (
             <div className="flex items-center justify-center h-screen bg-background">
                 <div className="text-center">
-                    <p className="text-text-secondary mb-4">{t("notFound")}</p>
+                    <p className="text-text-secondary mb-4">
+                        {seriesId ? t("episodeNotFound") : t("notFound")}
+                    </p>
                     <button
-                        onClick={handleBackToHome}
+                        onClick={handleBackFromNotFound}
                         className="text-primary hover:underline"
                     >
-                        {t("backToList")}
+                        {seriesId ? t("backToSeries") : t("backToList")}
                     </button>
                 </div>
             </div>
@@ -285,12 +287,13 @@ function EntityExtractionConfirm() {
     const ts = useTranslations("script");
     const pendingExtraction = useProjectStore((s) => s.pendingExtraction);
     const currentProject = useProjectStore((s) => s.currentProject);
+    const isAnalyzing = useProjectStore((s) => s.isAnalyzing);
     const confirmExtraction = useProjectStore((s) => s.confirmExtraction);
     const discardExtraction = useProjectStore((s) => s.discardExtraction);
 
-    const handleConfirm = async () => {
+    const handleConfirm = async (preserveFrames: boolean) => {
         try {
-            await confirmExtraction();
+            await confirmExtraction(preserveFrames);
             const refreshed = useProjectStore.getState().currentProject;
             if (refreshed?.series_id) {
                 document.dispatchEvent(new CustomEvent("lumenx:openReconcile"));
@@ -310,6 +313,7 @@ function EntityExtractionConfirm() {
         <EntityConfirmModal
             isOpen={!!pendingExtraction}
             preview={pendingExtraction}
+            loading={isAnalyzing}
             currentCounts={{
                 characters: currentProject?.characters?.length ?? 0,
                 scenes: currentProject?.scenes?.length ?? 0,

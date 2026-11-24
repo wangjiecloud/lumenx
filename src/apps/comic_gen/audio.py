@@ -9,7 +9,9 @@ from ...audio.tts import TTSProcessor
 logger = get_logger(__name__)
 
 
-def _compute_dialogue_hash(text: str, voice_id: Optional[str], instructions: Optional[str]) -> str:
+def _compute_dialogue_hash(
+    text: str, voice_id: Optional[str], instructions: Optional[str]
+) -> str:
     """PR-3j · Snapshot hash for stale detection. Frame is STALE when current
     (dialogue|voice_id|instructions) hash != stored snapshot."""
     payload = f"{text or ''}|{voice_id or ''}|{instructions or ''}"
@@ -21,14 +23,54 @@ def _compute_dialogue_hash(text: str, voice_id: Optional[str], instructions: Opt
 # catalog only; actual audio files are dropped in by the operator (or
 # left empty, in which case merge_videos will skip the BGM track).
 BGM_PRESETS: List[Dict[str, Any]] = [
-    {"id": "calm_warm",      "label": "温暖治愈",   "mood": "warm",      "url": "presets/bgm/calm_warm.mp3"},
-    {"id": "uplifting_pop",  "label": "明朗轻快",   "mood": "uplifting", "url": "presets/bgm/uplifting_pop.mp3"},
-    {"id": "epic_cinematic", "label": "史诗电影感", "mood": "epic",      "url": "presets/bgm/epic_cinematic.mp3"},
-    {"id": "mystery_ambient","label": "悬疑氛围",   "mood": "mystery",   "url": "presets/bgm/mystery_ambient.mp3"},
-    {"id": "sad_piano",      "label": "忧伤钢琴",   "mood": "sad",       "url": "presets/bgm/sad_piano.mp3"},
-    {"id": "tension_drama",  "label": "紧张戏剧",   "mood": "tense",     "url": "presets/bgm/tension_drama.mp3"},
-    {"id": "lofi_chill",     "label": "Lo-Fi 慵懒", "mood": "chill",     "url": "presets/bgm/lofi_chill.mp3"},
-    {"id": "fantasy_dreamy", "label": "奇幻梦境",   "mood": "dreamy",    "url": "presets/bgm/fantasy_dreamy.mp3"},
+    {
+        "id": "calm_warm",
+        "label": "温暖治愈",
+        "mood": "warm",
+        "url": "presets/bgm/calm_warm.mp3",
+    },
+    {
+        "id": "uplifting_pop",
+        "label": "明朗轻快",
+        "mood": "uplifting",
+        "url": "presets/bgm/uplifting_pop.mp3",
+    },
+    {
+        "id": "epic_cinematic",
+        "label": "史诗电影感",
+        "mood": "epic",
+        "url": "presets/bgm/epic_cinematic.mp3",
+    },
+    {
+        "id": "mystery_ambient",
+        "label": "悬疑氛围",
+        "mood": "mystery",
+        "url": "presets/bgm/mystery_ambient.mp3",
+    },
+    {
+        "id": "sad_piano",
+        "label": "忧伤钢琴",
+        "mood": "sad",
+        "url": "presets/bgm/sad_piano.mp3",
+    },
+    {
+        "id": "tension_drama",
+        "label": "紧张戏剧",
+        "mood": "tense",
+        "url": "presets/bgm/tension_drama.mp3",
+    },
+    {
+        "id": "lofi_chill",
+        "label": "Lo-Fi 慵懒",
+        "mood": "chill",
+        "url": "presets/bgm/lofi_chill.mp3",
+    },
+    {
+        "id": "fantasy_dreamy",
+        "label": "奇幻梦境",
+        "mood": "dreamy",
+        "url": "presets/bgm/fantasy_dreamy.mp3",
+    },
 ]
 
 
@@ -60,7 +102,9 @@ def _effective_instructions(frame: StoryboardFrame) -> Optional[str]:
     return None
 
 
-def dialogue_audio_is_stale(frame: StoryboardFrame, character: Optional[Character]) -> bool:
+def dialogue_audio_is_stale(
+    frame: StoryboardFrame, character: Optional[Character]
+) -> bool:
     """True when frame.audio_url exists but its snapshot no longer matches
     the current (dialogue|voice|instructions) state."""
     if not frame.audio_url:
@@ -73,15 +117,22 @@ def dialogue_audio_is_stale(frame: StoryboardFrame, character: Optional[Characte
     current = _compute_dialogue_hash(text, voice_id, instructions)
     return current != frame.dialogue_text_hash
 
+
 class AudioGenerator:
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
-        self.output_dir = self.config.get('output_dir', 'output/audio')
-        
+        self.output_dir = self.config.get("output_dir", "output/audio")
+
         # Initialize TTS Processor
         try:
-            self.tts = TTSProcessor()
-            logger.info("TTS Processor initialized successfully")
+            from ...models.local import local_enabled, get_local_tts
+
+            if local_enabled("tts"):
+                self.tts = get_local_tts()
+                logger.info("TTS Processor initialized with local CosyVoice3 backend")
+            else:
+                self.tts = TTSProcessor()
+                logger.info("TTS Processor initialized successfully")
         except Exception as e:
             logger.warning(f"Failed to initialize TTS Processor: {e}. Using mock mode.")
             self.tts = None
@@ -100,24 +151,48 @@ class AudioGenerator:
                 {
                     # Use actual model_id (server sends "Cherry" not "qwen3_cherry")
                     # so frontend can pass it back unchanged for synthesis.
-                    "id": meta['model_id'],
-                    "name": meta['name'],
-                    "gender": meta.get('gender', 'Unknown'),
-                    "model": meta.get('model', 'cosyvoice-v2'),
-                    "family": meta.get('family', 'cosyvoice'),
-                    "supports_instruction": meta.get('supports_instruction', False),
-                    "dialect": meta.get('dialect'),
-                    "lang_primary": meta.get('lang_primary'),
+                    "id": meta["model_id"],
+                    "name": meta["name"],
+                    "gender": meta.get("gender", "Unknown"),
+                    "model": meta.get("model", "cosyvoice-v2"),
+                    "family": meta.get("family", "cosyvoice"),
+                    "supports_instruction": meta.get("supports_instruction", False),
+                    "dialect": meta.get("dialect"),
+                    "lang_primary": meta.get("lang_primary"),
                     "origin": "system",  # custom voices (clone/design) come from a separate endpoint
                 }
                 for meta in voices_dict.values()
             ]
         else:
             return [
-                {"id": "longxiaochun_v2", "name": "龙小淳 (知性女) - CosyVoice", "gender": "Female", "family": "cosyvoice", "origin": "system"},
-                {"id": "longyue_v2", "name": "龙悦 (温柔女) - CosyVoice", "gender": "Female", "family": "cosyvoice", "origin": "system"},
-                {"id": "longcheng_v2", "name": "龙诚 (睿智青年) - CosyVoice", "gender": "Male", "family": "cosyvoice", "origin": "system"},
-                {"id": "longshu_v2", "name": "龙书 (播报男) - CosyVoice", "gender": "Male", "family": "cosyvoice", "origin": "system"},
+                {
+                    "id": "longxiaochun_v2",
+                    "name": "龙小淳 (知性女) - CosyVoice",
+                    "gender": "Female",
+                    "family": "cosyvoice",
+                    "origin": "system",
+                },
+                {
+                    "id": "longyue_v2",
+                    "name": "龙悦 (温柔女) - CosyVoice",
+                    "gender": "Female",
+                    "family": "cosyvoice",
+                    "origin": "system",
+                },
+                {
+                    "id": "longcheng_v2",
+                    "name": "龙诚 (睿智青年) - CosyVoice",
+                    "gender": "Male",
+                    "family": "cosyvoice",
+                    "origin": "system",
+                },
+                {
+                    "id": "longshu_v2",
+                    "name": "龙书 (播报男) - CosyVoice",
+                    "gender": "Male",
+                    "family": "cosyvoice",
+                    "origin": "system",
+                },
             ]
 
     def generate_dialogue(
@@ -141,22 +216,35 @@ class AudioGenerator:
         if instructions is None:
             instructions = _effective_instructions(frame)
 
-        logger.info(f"Generating dialogue for {character.name}: {text} (Speed: {speed}, Pitch: {pitch}, Volume: {volume}, instr: {instructions or '-'})")
+        logger.info(
+            f"Generating dialogue for {character.name}: {text} (Speed: {speed}, Pitch: {pitch}, Volume: {volume}, instr: {instructions or '-'})"
+        )
 
         if not self.tts:
             frame.status = GenerationStatus.FAILED
-            frame.audio_error = "TTS service not available. Check DASHSCOPE_API_KEY configuration."
-            logger.warning(f"TTS not initialized, cannot generate audio for frame {frame.id}")
+            frame.audio_error = (
+                "TTS service not available. Check DASHSCOPE_API_KEY configuration."
+            )
+            logger.warning(
+                f"TTS not initialized, cannot generate audio for frame {frame.id}"
+            )
             return frame
 
         if not character.voice_id:
             frame.status = GenerationStatus.FAILED
             frame.audio_error = f"No voice assigned to character '{character.name}'. Please assign a voice first."
-            logger.warning(f"No voice_id for character {character.name}, cannot generate audio")
+            logger.warning(
+                f"No voice_id for character {character.name}, cannot generate audio"
+            )
             return frame
 
         return self._real_generate_dialogue(
-            frame, character, text, speed, pitch, volume,
+            frame,
+            character,
+            text,
+            speed,
+            pitch,
+            volume,
             instructions=instructions,
             model_override=model_override,
             family_override=family_override,
@@ -176,14 +264,18 @@ class AudioGenerator:
     ) -> StoryboardFrame:
         """Generate dialogue using real TTS."""
         try:
-            output_path = os.path.join(self.output_dir, 'dialogue', f"{frame.id}.mp3")
+            output_path = os.path.join(self.output_dir, "dialogue", f"{frame.id}.mp3")
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             voice = character.voice_id
 
             self.tts.synthesize(
-                text, output_path, voice=voice,
-                speech_rate=speed, pitch_rate=pitch, volume=volume,
+                text,
+                output_path,
+                voice=voice,
+                speech_rate=speed,
+                pitch_rate=pitch,
+                volume=volume,
                 instructions=instructions,
                 model_override=model_override,
                 family_override=family_override,
@@ -205,55 +297,65 @@ class AudioGenerator:
 
         return frame
 
-    def _mock_generate_dialogue(self, frame: StoryboardFrame, character: Character, text: str, speed: float, pitch: float, volume: int) -> StoryboardFrame:
+    def _mock_generate_dialogue(
+        self,
+        frame: StoryboardFrame,
+        character: Character,
+        text: str,
+        speed: float,
+        pitch: float,
+        volume: int,
+    ) -> StoryboardFrame:
         """Mock fallback — marks frame as FAILED instead of writing dummy bytes."""
         frame.status = GenerationStatus.FAILED
         frame.audio_error = "TTS service unavailable (mock mode)"
-        logger.warning(f"Mock generate_dialogue called for frame {frame.id} — marking as FAILED")
+        logger.warning(
+            f"Mock generate_dialogue called for frame {frame.id} — marking as FAILED"
+        )
         return frame
 
     def generate_sfx(self, frame: StoryboardFrame) -> StoryboardFrame:
         """Generates sound effects for the frame."""
         frame.status = GenerationStatus.PROCESSING
-        
+
         try:
             # TODO: Implement actual SFX call (e.g., MMAudio)
             # For now, we mock it.
             logger.info(f"Generating SFX for: {frame.action_description}")
-            
-            output_path = os.path.join(self.output_dir, 'sfx', f"{frame.id}.mp3")
+
+            output_path = os.path.join(self.output_dir, "sfx", f"{frame.id}.mp3")
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
+
             # Create a dummy file
-            with open(output_path, 'wb') as f:
-                f.write(b'dummy sfx content')
-                
+            with open(output_path, "wb") as f:
+                f.write(b"dummy sfx content")
+
             # Store relative path for frontend serving
             rel_path = os.path.relpath(output_path, "output")
             frame.sfx_url = rel_path
             frame.status = GenerationStatus.COMPLETED
-            
+
         except Exception as e:
             logger.error(f"Failed to generate SFX for frame {frame.id}: {e}")
             frame.status = GenerationStatus.FAILED
-            
+
         return frame
 
     def generate_sfx_from_video(self, frame: StoryboardFrame) -> StoryboardFrame:
         """Generates SFX based on video content (Video-to-Audio)."""
         if not frame.video_url:
             return frame
-            
+
         logger.info(f"Generating SFX from video for frame {frame.id}")
         # Mock V2A Logic
         time.sleep(1)
-        
-        output_path = os.path.join(self.output_dir, 'sfx', f"{frame.id}_v2a.mp3")
+
+        output_path = os.path.join(self.output_dir, "sfx", f"{frame.id}_v2a.mp3")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        with open(output_path, 'wb') as f:
-            f.write(b'dummy v2a sfx content')
-            
+
+        with open(output_path, "wb") as f:
+            f.write(b"dummy v2a sfx content")
+
         frame.sfx_url = os.path.relpath(output_path, "output")
         return frame
 
@@ -262,12 +364,12 @@ class AudioGenerator:
         logger.info(f"Generating BGM for frame {frame.id}")
         # Mock MusicGen Logic
         time.sleep(1)
-        
-        output_path = os.path.join(self.output_dir, 'bgm', f"{frame.id}.mp3")
+
+        output_path = os.path.join(self.output_dir, "bgm", f"{frame.id}.mp3")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        with open(output_path, 'wb') as f:
-            f.write(b'dummy bgm content')
-            
+
+        with open(output_path, "wb") as f:
+            f.write(b"dummy bgm content")
+
         frame.bgm_url = os.path.relpath(output_path, "output")
         return frame

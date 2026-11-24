@@ -1,6 +1,7 @@
 "use client";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Users, MapPin, Box, Check, X } from "lucide-react";
+import { Users, MapPin, Box, Check, X, Loader2 } from "lucide-react";
 import { useTranslations } from "next-intl";
 
 export interface ExtractionPreview {
@@ -13,7 +14,8 @@ interface EntityConfirmModalProps {
     isOpen: boolean;
     preview: ExtractionPreview | null;
     currentCounts: { characters: number; scenes: number; props: number };
-    onConfirm: () => void;
+    loading?: boolean;
+    onConfirm: (preserveFrames: boolean) => void;
     onDiscard: () => void;
 }
 
@@ -21,10 +23,12 @@ export default function EntityConfirmModal({
     isOpen,
     preview,
     currentCounts,
+    loading = false,
     onConfirm,
     onDiscard,
 }: EntityConfirmModalProps) {
     const t = useTranslations("script");
+    const [preserveFrames, setPreserveFrames] = useState(false);
 
     if (!preview) return null;
 
@@ -96,18 +100,29 @@ export default function EntityConfirmModal({
 
                         {/* Footer */}
                         <footer className="flex items-center justify-end gap-3 px-6 py-4 border-t border-glass-border">
+                            <label className="mr-auto flex items-center gap-2 text-xs text-text-secondary cursor-pointer select-none">
+                                <input
+                                    type="checkbox"
+                                    checked={preserveFrames}
+                                    onChange={(e) => setPreserveFrames(e.target.checked)}
+                                    className="h-3.5 w-3.5 accent-[var(--primary)]"
+                                />
+                                保留现有分镜（勾选则沿用当前 storyboard，仅重建实体）
+                            </label>
                             <button
                                 onClick={onDiscard}
-                                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm text-text-secondary hover:text-foreground hover:bg-hover-bg transition-colors"
+                                disabled={loading}
+                                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm text-text-secondary hover:text-foreground hover:bg-hover-bg transition-colors disabled:opacity-50 disabled:pointer-events-none"
                             >
                                 <X size={14} />
                                 {t("extractDiscard")}
                             </button>
                             <button
-                                onClick={onConfirm}
-                                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-white hover:bg-primary/90 transition-colors"
+                                onClick={() => onConfirm(preserveFrames)}
+                                disabled={loading}
+                                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-white hover:bg-primary/90 transition-colors disabled:opacity-60 disabled:pointer-events-none"
                             >
-                                <Check size={14} />
+                                {loading ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
                                 {t("extractApply")}
                             </button>
                         </footer>

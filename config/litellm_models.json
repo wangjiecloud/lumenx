@@ -1,0 +1,323 @@
+{
+  "default": "deepseek-v4.1-flash",
+  "models": [
+    {
+      "id": "claude-sonnet-4.6",
+      "name": "Claude-4.6-Sonnet",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "claude-sonnet-4.5",
+      "name": "Claude-4.5-Sonnet",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "claude-haiku-4.5",
+      "name": "Claude-4.5-Haiku",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "qwen3.6-plus",
+      "name": "Qwen3.6-Plus",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "name": "Gemini-3.1-Pro-Preview",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "name": "Gemini-3-Flash",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gpt-5.4",
+      "name": "GPT-5.4",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gpt-5.2-codex",
+      "name": "GPT-5.2-Codex",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gpt-5.2",
+      "name": "GPT-5.2",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "glm-5",
+      "name": "GLM-5",
+      "capabilities": [
+        "tool_use"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "DeepSeek-V3.2",
+      "name": "Deepseek-v3.2",
+      "capabilities": [
+        "tool_use"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "qwen3-coder-480b-a35b-instruct",
+      "name": "Qwen3-Coder",
+      "capabilities": [
+        "tool_use"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "auto_router",
+      "name": "Auto",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5",
+      "name": "Claude-5-Sonnet",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "qwen3.8-max-edp",
+      "name": "Qwen3.8-Max",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "qwen3.8-flash",
+      "name": "Qwen3.8-Flash",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "qwen3.7-plus",
+      "name": "Qwen3.7-Plus",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "name": "GPT-5.6-Luna",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gpt-6.1-sol-edp",
+      "name": "GPT-6.1-Sol",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "aliyun-glm-5.2",
+      "name": "Aliyun-GLM-5.2-Outer",
+      "capabilities": [
+        "tool_use"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "hw-glm-5.3",
+      "name": "HW-GLM-5.3",
+      "capabilities": [
+        "tool_use"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "deepseek_v4",
+      "name": "Deepseek-v4-pro",
+      "capabilities": [
+        "tool_use"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "volcengine-glm-5.3-flash",
+      "name": "Volcengine-GLM-5.3-Flash",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "name": "GPT-6.1-Terra",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "volcengine-deepseek-v4.1-flash",
+      "name": "VC-Deepseek-V4.1-Flash",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "name": "DeepSeek-V4.1-Flash",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    },
+    {
+      "id": "qwen-4",
+      "name": "Qwen-4",
+      "capabilities": [
+        "tool_use",
+        "image_input"
+      ],
+      "roles": [
+        "chat",
+        "edit"
+      ]
+    }
+  ]
+}

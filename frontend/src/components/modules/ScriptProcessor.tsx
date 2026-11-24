@@ -8,6 +8,7 @@ import { api, crudApi } from "@/lib/api";
 import { useProjectStore } from "@/store/projectStore";
 import { toast } from "@/store/toastStore";
 import StepPageHeader, { StepPill } from "@/components/shared/StepPageHeader";
+import StepGuide from "@/components/shared/StepGuide";
 import PreviousEpisodeSummary from "@/components/modules/PreviousEpisodeSummary";
 import ReconcileModal from "@/components/modules/ReconcileModal";
 
@@ -232,6 +233,14 @@ export default function ScriptProcessor() {
                             <span>{isAnalyzing ? ts("analyzingScript") : ts("extractEntities")}</span>
                         </button>
                     )}
+                />
+                <StepGuide
+                    steps={[
+                        "在文本区粘贴或直接编辑本集正文。",
+                        "点右上角「提取实体」，等待 20–60 秒（LLM 抽取角色/场景/道具）。",
+                        "若有别名（如“厉飞雨”其实是“韩立”），在对齐窗口里选择「合并到系列」。",
+                        "确认无误后，点左侧「2. 风格定调」继续。",
+                    ]}
                 />
                 <div className="flex-1 relative p-6 bg-surface overflow-hidden">
                     <textarea

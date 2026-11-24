@@ -568,7 +568,7 @@ export default function ShotCard({
                             {String(index + 1).padStart(2, "0")}
                         </div>
                         <div className="font-mono text-[0.6875rem] uppercase tracking-[0.08em] text-text-muted leading-tight">
-                            <span>SHOT</span>
+                            <span>镜头</span>
                             {shot.shotSize ? (
                                 <span className="ml-1.5 text-text-secondary font-medium">· {shot.shotSize}</span>
                             ) : null}

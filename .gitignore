@@ -138,3 +138,7 @@ frontend/docs/
 src-tauri/target/
 src-tauri/binaries/*.app
 src-tauri/gen/
+
+# offline wheel bundles
+lumenx_wheels/
+.venv-local/

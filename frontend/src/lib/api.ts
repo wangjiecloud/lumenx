@@ -93,6 +93,16 @@ export interface EnvConfigPayload {
     KLING_ACCESS_KEY?: string;
     KLING_SECRET_KEY?: string;
     VIDU_API_KEY?: string;
+    LLM_PROVIDER?: string;
+    LLM_MODEL?: string;
+    LITELLM_MODEL?: string;
+    llm_configured?: boolean;
+    IMAGE_BACKEND?: string;
+    VIDEO_BACKEND?: string;
+    TTS_BACKEND?: string;
+    local_models_ready?: boolean;
+    MODELS_DIR?: string;
+    requires_config?: boolean;
     endpoint_overrides?: Record<string, string>;
     // Secrets from GET are masked (bullets + last 4 chars). This map reports
     // which credential fields are actually configured on the backend.
@@ -100,13 +110,34 @@ export interface EnvConfigPayload {
     [key: string]: string | Record<string, string> | Record<string, boolean> | boolean | undefined;
 }
 
+export interface LlmModelOption {
+    id: string;
+    name: string;
+    capabilities?: string[];
+    roles?: string[];
+}
+
+export interface LlmModelsResponse {
+    provider: string;
+    default: string;
+    models: LlmModelOption[];
+}
+
 // R2V v2 Phase 4 — Cross-episode reconcile types
 export interface ReconcileSuggestion {
     local_id: string;
     local_name: string;
+    local_aliases?: string[];
     suggested_series_id: string | null;
     suggested_series_name: string | null;
+    suggested_series_aliases?: string[];
     confidence: number;
+}
+
+export interface ReconcileCandidate {
+    id: string;
+    name: string;
+    aliases?: string[];
 }
 
 export interface BgmPreset {
@@ -120,6 +151,7 @@ export interface ReconcileAction {
     local_id: string;
     action: "merge_into_series" | "create_new_in_series" | "skip";
     target_series_id?: string;
+    update_description?: boolean;
 }
 
 export interface VideoTask {
@@ -245,8 +277,11 @@ export const api = {
         return res.data;
     },
 
-    reparseProject: async (scriptId: string, text: string) => {
-        const res = await axios.put(`${API_URL}/projects/${scriptId}/reparse`, { text });
+    reparseProject: async (scriptId: string, text: string, preserveFrames: boolean = false) => {
+        const res = await axios.put(`${API_URL}/projects/${scriptId}/reparse`, {
+            text,
+            preserve_frames: preserveFrames,
+        });
         return { ...res.data, originalText: res.data.original_text };
     },
 
@@ -525,8 +560,40 @@ export const api = {
         return res.data;
     },
 
+    assembleNarration: async (scriptId: string) => {
+        const res = await axios.post(`${API_URL}/projects/${scriptId}/assemble_narration`, null, { timeout: 1800000 });
+        return res.data;
+    },
+
+    motionComic: async (scriptId: string) => {
+        const res = await axios.post(`${API_URL}/projects/${scriptId}/motion_comic`);
+        return res.data;
+    },
+
+    autoMotion: async (scriptId: string) => {
+        const res = await axios.post(`${API_URL}/projects/${scriptId}/video_tasks/auto`);
+        return res.data;
+    },
+
     getTaskStatus: async (taskId: string) => {
         const res = await axios.get(`${API_URL}/tasks/${taskId}`);
+        return res.data;
+    },
+
+    listTasks: async (activeOnly: boolean = false) => {
+        const res = await axios.get(`${API_URL}/tasks`, { params: { active_only: activeOnly } });
+        return res.data?.tasks ?? [];
+    },
+    pauseTask: async (taskId: string) => {
+        const res = await axios.post(`${API_URL}/tasks/${taskId}/pause`);
+        return res.data;
+    },
+    resumeTask: async (taskId: string) => {
+        const res = await axios.post(`${API_URL}/tasks/${taskId}/resume`);
+        return res.data;
+    },
+    stopTask: async (taskId: string) => {
+        const res = await axios.post(`${API_URL}/tasks/${taskId}/stop`);
         return res.data;
     },
 
@@ -566,6 +633,14 @@ export const api = {
 
     toggleAssetLock: async (scriptId: string, assetId: string, assetType: string) => {
         const res = await axios.post(`${API_URL}/projects/${scriptId}/assets/toggle_lock`, {
+            asset_id: assetId,
+            asset_type: assetType
+        });
+        return res.data;
+    },
+
+    toggleSeriesAssetLock: async (seriesId: string, assetId: string, assetType: string) => {
+        const res = await axios.post(`${API_URL}/series/${seriesId}/assets/toggle_lock`, {
             asset_id: assetId,
             asset_type: assetType
         });
@@ -612,6 +687,41 @@ export const api = {
             asset_id: assetId,
             asset_type: assetType,
             variant_id: variantId
+        });
+        return res.data;
+    },
+
+    seriesDeleteAsset: async (seriesId: string, assetId: string, assetType: string) => {
+        const res = await axios.post(`${API_URL}/series/${seriesId}/assets/delete`, {
+            asset_id: assetId,
+            asset_type: assetType,
+        });
+        return res.data;
+    },
+
+    seriesDeleteAssetVariant: async (seriesId: string, assetId: string, assetType: string, variantId: string) => {
+        const res = await axios.post(`${API_URL}/series/${seriesId}/assets/variant/delete`, {
+            asset_id: assetId,
+            asset_type: assetType,
+            variant_id: variantId,
+        });
+        return res.data;
+    },
+
+    seriesSelectAssetVariant: async (seriesId: string, assetId: string, assetType: string, variantId: string) => {
+        const res = await axios.post(`${API_URL}/series/${seriesId}/assets/select_variant`, {
+            asset_id: assetId,
+            asset_type: assetType,
+            variant_id: variantId,
+        });
+        return res.data;
+    },
+
+    updateSeriesAssetAttributes: async (seriesId: string, assetId: string, assetType: string, attributes: Record<string, any>) => {
+        const res = await axios.post(`${API_URL}/series/${seriesId}/assets/update_attributes`, {
+            asset_id: assetId,
+            asset_type: assetType,
+            attributes,
         });
         return res.data;
     },
@@ -1182,6 +1292,11 @@ export const api = {
         return res.data;
     },
 
+    getLlmModels: async (): Promise<LlmModelsResponse> => {
+        const res = await axios.get<LlmModelsResponse>(`${API_URL}/llm/models`);
+        return res.data;
+    },
+
     saveEnvConfig: async (config: EnvConfigPayload) => {
         const res = await axios.post(`${API_URL}/config/env`, config, {
             timeout: 60000, // 60 seconds timeout
@@ -1251,7 +1366,20 @@ export const api = {
      *  assetType 为单数（"character"|"scene"|"prop"）。data 可含 name/description/persona/image_url/voice_id。 */
     createLibraryAsset: async (
         assetType: string,
-        data: { name: string; description?: string; persona?: string; image_url?: string; voice_id?: string },
+        data: {
+            name: string;
+            description?: string;
+            persona?: string;
+            image_url?: string;
+            voice_id?: string;
+            role?: string;
+            aliases?: string[];
+            clothing?: string;
+            age?: string;
+            gender?: string;
+            prompt_en?: string;
+            visual_weight?: number;
+        },
     ) => {
         const res = await axios.post(`${API_URL}/library/assets`, { asset_type: assetType, ...data });
         return res.data;
@@ -1350,6 +1478,11 @@ export const api = {
         characters: ReconcileSuggestion[];
         scenes: ReconcileSuggestion[];
         props: ReconcileSuggestion[];
+        series_candidates?: {
+            characters: ReconcileCandidate[];
+            scenes: ReconcileCandidate[];
+            props: ReconcileCandidate[];
+        };
     }> => {
         const res = await axios.get(`${API_URL}/projects/${scriptId}/reconcile/suggestions`);
         return res.data;
@@ -1499,7 +1632,7 @@ export const api = {
         });
         return response.data;
     },
-    importFileConfirm: async (data: { title: string; description?: string; text: string; episodes: any[] }) => {
+    importFileConfirm: async (data: { title: string; description?: string; text?: string; import_id?: string; episodes: any[] }) => {
         const response = await axios.post(`${API_URL}/series/import/confirm`, data);
         return response.data;
     },
