@@ -14,7 +14,14 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from src.apps.comic_gen.models import (
-    Series, Script, Character, Scene, Prop, PromptConfig, ModelSettings,
+    Series,
+    Script,
+    Character,
+    Scene,
+    Prop,
+    PromptConfig,
+    ModelSettings,
+    GlobalAssetLibrary,
 )
 from src.apps.comic_gen.pipeline import ComicGenPipeline
 
@@ -23,20 +30,25 @@ from src.apps.comic_gen.pipeline import ComicGenPipeline
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def pipeline(tmp_path):
     """Create a pipeline with temp data files, bypassing real IO."""
-    with patch("src.apps.comic_gen.pipeline.ScriptProcessor") as MockSP, \
-         patch("src.apps.comic_gen.pipeline.AssetGenerator"), \
-         patch("src.apps.comic_gen.pipeline.StoryboardGenerator"), \
-         patch("src.apps.comic_gen.pipeline.VideoGenerator"), \
-         patch("src.apps.comic_gen.pipeline.AudioGenerator"), \
-         patch("src.apps.comic_gen.pipeline.ExportManager"):
+    with (
+        patch("src.apps.comic_gen.pipeline.ScriptProcessor") as MockSP,
+        patch("src.apps.comic_gen.pipeline.AssetGenerator"),
+        patch("src.apps.comic_gen.pipeline.StoryboardGenerator"),
+        patch("src.apps.comic_gen.pipeline.VideoGenerator"),
+        patch("src.apps.comic_gen.pipeline.AudioGenerator"),
+        patch("src.apps.comic_gen.pipeline.ExportManager"),
+    ):
         p = ComicGenPipeline()
     p.data_file = str(tmp_path / "projects.json")
     p.series_data_file = str(tmp_path / "series.json")
+    p.library_data_file = str(tmp_path / "library.json")
     p.scripts = {}
     p.series_store = {}
+    p.library_store = GlobalAssetLibrary()
     return p
 
 
@@ -47,8 +59,11 @@ def _ts():
 def _make_script(**kw) -> Script:
     now = _ts()
     defaults = dict(
-        id=str(uuid.uuid4()), title="Episode", original_text="text",
-        created_at=now, updated_at=now,
+        id=str(uuid.uuid4()),
+        title="Episode",
+        original_text="text",
+        created_at=now,
+        updated_at=now,
     )
     defaults.update(kw)
     return Script(**defaults)
@@ -56,29 +71,44 @@ def _make_script(**kw) -> Script:
 
 def _make_series(**kw) -> Series:
     now = _ts()
-    defaults = dict(id=str(uuid.uuid4()), title="Series", created_at=now, updated_at=now)
+    defaults = dict(
+        id=str(uuid.uuid4()), title="Series", created_at=now, updated_at=now
+    )
     defaults.update(kw)
     return Series(**defaults)
 
 
 def _make_character(name="Hero", **kw) -> Character:
-    return Character(id=kw.pop("id", str(uuid.uuid4())), name=name,
-                     description=kw.pop("description", "A brave hero"), **kw)
+    return Character(
+        id=kw.pop("id", str(uuid.uuid4())),
+        name=name,
+        description=kw.pop("description", "A brave hero"),
+        **kw,
+    )
 
 
 def _make_scene(name="Forest", **kw) -> Scene:
-    return Scene(id=kw.pop("id", str(uuid.uuid4())), name=name,
-                 description=kw.pop("description", "A dark forest"), **kw)
+    return Scene(
+        id=kw.pop("id", str(uuid.uuid4())),
+        name=name,
+        description=kw.pop("description", "A dark forest"),
+        **kw,
+    )
 
 
 def _make_prop(name="Sword", **kw) -> Prop:
-    return Prop(id=kw.pop("id", str(uuid.uuid4())), name=name,
-                description=kw.pop("description", "A magic sword"), **kw)
+    return Prop(
+        id=kw.pop("id", str(uuid.uuid4())),
+        name=name,
+        description=kw.pop("description", "A magic sword"),
+        **kw,
+    )
 
 
 # ===================================================================
 # 1. PromptConfig 3-level fallback integration
 # ===================================================================
+
 
 class TestPromptConfigIntegration:
     """Tests that PromptConfig fallback works correctly across all polish types."""
@@ -94,7 +124,10 @@ class TestPromptConfigIntegration:
         """Episode-level config should override Series-level for all types."""
         now = _ts()
         series = Series(
-            id="s1", title="S", created_at=now, updated_at=now,
+            id="s1",
+            title="S",
+            created_at=now,
+            updated_at=now,
             prompt_config=PromptConfig(
                 storyboard_polish="series storyboard",
                 video_polish="series video",
@@ -120,7 +153,10 @@ class TestPromptConfigIntegration:
         """Series-level config should override system default."""
         now = _ts()
         series = Series(
-            id="s1", title="S", created_at=now, updated_at=now,
+            id="s1",
+            title="S",
+            created_at=now,
+            updated_at=now,
             prompt_config=PromptConfig(
                 storyboard_polish="series storyboard",
                 video_polish="series video",
@@ -142,7 +178,10 @@ class TestPromptConfigIntegration:
         """Whitespace-only episode config should fall through to Series."""
         now = _ts()
         series = Series(
-            id="s1", title="S", created_at=now, updated_at=now,
+            id="s1",
+            title="S",
+            created_at=now,
+            updated_at=now,
             prompt_config=PromptConfig(storyboard_polish="series prompt"),
         )
         ep = _make_script()
@@ -158,6 +197,7 @@ class TestPromptConfigIntegration:
 
         result = pipeline.get_effective_prompt("storyboard_polish", ep, series=None)
         from src.apps.comic_gen.llm import DEFAULT_STORYBOARD_POLISH_PROMPT
+
         assert result == DEFAULT_STORYBOARD_POLISH_PROMPT
 
     def test_episode_in_series_auto_resolves_prompt(self, pipeline):
@@ -183,6 +223,7 @@ class TestPromptConfigIntegration:
 # ===================================================================
 # 2. Asset resolution integration (Phase 1 + 3)
 # ===================================================================
+
 
 class TestAssetResolutionIntegration:
     """Tests asset merging between Series and Episode."""
@@ -277,6 +318,7 @@ class TestAssetResolutionIntegration:
 # 3. ModelSettings inheritance integration
 # ===================================================================
 
+
 class TestModelSettingsIntegration:
     """Tests ModelSettings on Series model."""
 
@@ -323,6 +365,7 @@ class TestModelSettingsIntegration:
 # 4. Episode lifecycle in Series (Phase 1 + 3)
 # ===================================================================
 
+
 class TestEpisodeLifecycleIntegration:
     """Tests the full episode lifecycle within a series."""
 
@@ -366,9 +409,9 @@ class TestEpisodeLifecycleIntegration:
         s = pipeline.create_series("S")
         eps = []
         for i in range(3):
-            ep = _make_script(title=f"Ep{i+1}")
+            ep = _make_script(title=f"Ep{i + 1}")
             pipeline.scripts[ep.id] = ep
-            pipeline.add_episode_to_series(s.id, ep.id, episode_number=i+1)
+            pipeline.add_episode_to_series(s.id, ep.id, episode_number=i + 1)
             eps.append(ep)
 
         episodes = pipeline.get_series_episodes(s.id)
@@ -398,6 +441,7 @@ class TestEpisodeLifecycleIntegration:
 # ===================================================================
 # 5. Text splitting robustness
 # ===================================================================
+
 
 class TestTextSplittingRobustness:
     """Additional edge cases for _split_text_by_markers."""
@@ -453,6 +497,7 @@ class TestTextSplittingRobustness:
 # ===================================================================
 # 6. Cross-series import integration
 # ===================================================================
+
 
 class TestCrossSeriesImportIntegration:
     """Tests cross-series asset import with full lifecycle."""
@@ -511,6 +556,7 @@ class TestCrossSeriesImportIntegration:
 # 7. Series CRUD + persistence integration
 # ===================================================================
 
+
 class TestSeriesPersistenceIntegration:
     """Tests that Series CRUD correctly persists through save/load cycle."""
 
@@ -525,6 +571,7 @@ class TestSeriesPersistenceIntegration:
         s = pipeline.create_series("Old Title")
         old_ts = s.updated_at
         import time
+
         time.sleep(0.01)
         updated = pipeline.update_series(s.id, {"title": "New Title"})
         assert updated.updated_at > old_ts

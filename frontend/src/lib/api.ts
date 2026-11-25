@@ -560,6 +560,23 @@ export const api = {
         return res.data;
     },
 
+    seriesGenerateAsset: async (seriesId: string, assetId: string, assetType: string, stylePreset: string, stylePrompt?: string, generationType: string = "all", prompt: string = "", applyStyle: boolean = true, negativePrompt: string = "", batchSize: number = 1, modelName?: string, aspectRatio?: string) => {
+        const res = await axios.post(`${API_URL}/series/${seriesId}/assets/generate`, {
+            asset_id: assetId,
+            asset_type: assetType,
+            style_preset: stylePreset,
+            style_prompt: stylePrompt,
+            generation_type: generationType,
+            prompt,
+            apply_style: applyStyle,
+            negative_prompt: negativePrompt,
+            batch_size: batchSize,
+            model_name: modelName,
+            aspect_ratio: aspectRatio,
+        });
+        return res.data;
+    },
+
     assembleNarration: async (scriptId: string) => {
         const res = await axios.post(`${API_URL}/projects/${scriptId}/assemble_narration`, null, { timeout: 1800000 });
         return res.data;
@@ -578,6 +595,11 @@ export const api = {
     getTaskStatus: async (taskId: string) => {
         const res = await axios.get(`${API_URL}/tasks/${taskId}`);
         return res.data;
+    },
+
+    getAssetPromptPreview: async (assetId: string) => {
+        const res = await axios.get(`${API_URL}/assets/${assetId}/prompt_preview`);
+        return res.data?.prompt ?? null;
     },
 
     listTasks: async (activeOnly: boolean = false) => {
@@ -705,6 +727,16 @@ export const api = {
             asset_type: assetType,
             variant_id: variantId,
         });
+        return res.data;
+    },
+
+    deleteLibraryAsset: async (assetType: string, assetId: string) => {
+        const res = await axios.delete(`${API_URL}/library/assets/${assetType}/${assetId}`);
+        return res.data;
+    },
+
+    deleteLibraryAssetVariant: async (assetType: string, assetId: string, variantId: string) => {
+        const res = await axios.delete(`${API_URL}/library/assets/${assetType}/${assetId}/variants/${variantId}`);
         return res.data;
     },
 
@@ -1371,6 +1403,7 @@ export const api = {
             description?: string;
             persona?: string;
             image_url?: string;
+            image_urls?: string[];
             voice_id?: string;
             role?: string;
             aliases?: string[];
@@ -1404,10 +1437,18 @@ export const api = {
             description?: string;
             persona?: string;
             image_url?: string;
+            image_urls?: string[];
+            append_images?: boolean;
             voice_id?: string;
             starred?: boolean;
             locked?: boolean;
             visual_weight?: number;
+            role?: string;
+            aliases?: string[];
+            clothing?: string;
+            age?: string;
+            gender?: string;
+            prompt_en?: string;
         },
     ) => {
         const res = await axios.put(`${API_URL}/library/assets/${assetType}/${assetId}`, patch);
@@ -1435,7 +1476,7 @@ export const api = {
     },
     updateSeries: async (
         seriesId: string,
-        data: { title?: string; description?: string; art_direction?: any },
+        data: { title?: string; description?: string; art_direction?: any; workflow_mode?: string; default_generation_mode?: string; content_mode?: string },
     ) => {
         const response = await axios.put(`${API_URL}/series/${seriesId}`, data);
         return response.data;

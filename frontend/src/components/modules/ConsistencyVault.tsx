@@ -177,6 +177,8 @@ export default function ConsistencyVault() {
         try {
             if (asset?.source === "series" && currentProject.series_id) {
                 await api.seriesDeleteAsset(currentProject.series_id, asset.id, type);
+            } else if (asset?.source === "global") {
+                await api.deleteLibraryAsset(type, asset.id);
             } else if (type === "character") {
                 await crudApi.deleteCharacter(currentProject.id, asset.id);
             } else if (type === "scene") {
@@ -752,6 +754,8 @@ function CharacterDetailModal({ asset, type, onClose, onUpdateDescription, onGen
         try {
             if (asset?.source === "series" && currentProject.series_id) {
                 await api.seriesDeleteAsset(currentProject.series_id, asset.id, type);
+            } else if (asset?.source === "global") {
+                await api.deleteLibraryAsset(type, asset.id);
             } else if (type === "character") {
                 await crudApi.deleteCharacter(currentProject.id, asset.id);
             } else if (type === "scene") {

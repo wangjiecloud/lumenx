@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Settings, X, Image, Video, Layout, Check, User, Building, Box, Loader2 } from 'lucide-react';
+import { Settings, X, Image, Video, Layout, Check, User, Building, Box, Loader2, Zap, Film } from 'lucide-react';
 import { ASPECT_RATIOS } from '@/store/projectStore';
 import {
     SERIES_IMAGE_MODELS,
@@ -31,6 +31,7 @@ export default function SeriesModelSettingsModal({ isOpen, onClose, seriesId, on
     const [sceneAspectRatio, setSceneAspectRatio] = useState(defaultSettings.scene_aspect_ratio);
     const [propAspectRatio, setPropAspectRatio] = useState(defaultSettings.prop_aspect_ratio);
     const [storyboardAspectRatio, setStoryboardAspectRatio] = useState(defaultSettings.storyboard_aspect_ratio);
+    const [workflowMode, setWorkflowMode] = useState<'r2v' | 'i2v_legacy'>('r2v');
     const [isLoading, setIsLoading] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
@@ -55,12 +56,19 @@ export default function SeriesModelSettingsModal({ isOpen, onClose, seriesId, on
                     setLoadError(t("loadSettingsFailed"));
                 })
                 .finally(() => setIsLoading(false));
+            api.getSeries(seriesId)
+                .then((data) => setWorkflowMode(data?.workflow_mode === 'i2v_legacy' ? 'i2v_legacy' : 'r2v'))
+                .catch(() => undefined);
         }
     }, [isOpen, seriesId]);
 
     const handleSave = async () => {
         setIsSaving(true);
         try {
+            await api.updateSeries(seriesId, {
+                workflow_mode: workflowMode,
+                default_generation_mode: workflowMode === 'r2v' ? 'r2v' : 'i2v',
+            });
             await api.updateSeriesModelSettings(seriesId, {
                 t2i_model: t2iModel,
                 i2i_model: i2iModel,
@@ -127,6 +135,41 @@ export default function SeriesModelSettingsModal({ isOpen, onClose, seriesId, on
                             </div>
                         ) : (
                             <>
+                                {/* Workflow mode */}
+                                <div className="space-y-3">
+                                    <div className="flex items-center gap-2 text-sm font-bold text-foreground">
+                                        <Zap size={16} className="text-yellow-400" />
+                                        <span>{t("workflowMode")}</span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <button
+                                            onClick={() => setWorkflowMode('r2v')}
+                                            className={`flex items-start gap-3 p-3 rounded-lg border text-left transition-all ${workflowMode === 'r2v' ? 'border-primary/50 bg-primary/10' : 'border-glass-border bg-glass hover:border-glass-border'}`}
+                                        >
+                                            <Zap size={16} className={workflowMode === 'r2v' ? 'text-primary mt-0.5' : 'text-text-secondary mt-0.5'} />
+                                            <div className="flex-1">
+                                                <div className="text-sm font-semibold text-foreground">{t("workflowR2V")}</div>
+                                                <div className="text-[0.625rem] text-text-secondary mt-0.5">{t("workflowR2VDesc")}</div>
+                                            </div>
+                                            {workflowMode === 'r2v' && <Check size={16} className="text-primary" />}
+                                        </button>
+                                        <button
+                                            onClick={() => setWorkflowMode('i2v_legacy')}
+                                            className={`flex items-start gap-3 p-3 rounded-lg border text-left transition-all ${workflowMode === 'i2v_legacy' ? 'border-primary/50 bg-primary/10' : 'border-glass-border bg-glass hover:border-glass-border'}`}
+                                        >
+                                            <Film size={16} className={workflowMode === 'i2v_legacy' ? 'text-primary mt-0.5' : 'text-text-secondary mt-0.5'} />
+                                            <div className="flex-1">
+                                                <div className="text-sm font-semibold text-foreground">{t("workflowLegacy")}</div>
+                                                <div className="text-[0.625rem] text-text-secondary mt-0.5">{t("workflowLegacyDesc")}</div>
+                                            </div>
+                                            {workflowMode === 'i2v_legacy' && <Check size={16} className="text-primary" />}
+                                        </button>
+                                    </div>
+                                    <p className="text-[0.6875rem] text-text-secondary">{t("workflowSwitchHint")}</p>
+                                </div>
+
+                                <div className="border-t border-glass-border" />
+
                                 {/* Assets Section */}
                                 <div className="space-y-5">
                                     <div className="flex items-center gap-2 text-sm font-bold text-foreground">

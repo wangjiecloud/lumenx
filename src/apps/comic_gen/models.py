@@ -246,7 +246,9 @@ class VideoTask(BaseModel):
     )
     image_url: str
     prompt: str
-    prompt_en: Optional[str] = Field(None, description="English prompt used for local/vendor video models")
+    prompt_en: Optional[str] = Field(
+        None, description="English prompt used for local/vendor video models"
+    )
     status: str = "pending"  # pending, processing, completed, failed
     error: Optional[str] = Field(
         None,
@@ -354,7 +356,13 @@ class Character(BaseModel):
         description="别名/化名/昵称/绰号（如 二愣子、韩老魔、厉飞雨）",
     )
     role: str = Field("配角", description="角色定位：主角 | 重要配角 | 配角 | 龙套")
-    prompt_en: str = Field("", description="English image-generation prompt (bilingual asset)")
+    disposition: Optional[str] = Field(
+        None,
+        description="长期气质/面相倾向：和蔼 | 温和 | 刚正 | 威严 | 阴险 | 冷酷 | 狡黠 | 木讷 | 普通",
+    )
+    prompt_en: str = Field(
+        "", description="English image-generation prompt (bilingual asset)"
+    )
     description: str = Field(
         ..., description="Physical appearance and personality description"
     )
@@ -496,7 +504,9 @@ class Scene(BaseModel):
         default_factory=list, description="场景别名（如 别称、俗称）"
     )
     description: str = Field(..., description="Visual description of the environment")
-    prompt_en: str = Field("", description="English image-generation prompt (bilingual asset)")
+    prompt_en: str = Field(
+        "", description="English image-generation prompt (bilingual asset)"
+    )
     visual_weight: int = Field(3, description="Visual importance weight (1-5)")
     time_of_day: Optional[str] = Field(
         None, description="Time of day (e.g. Night, Day)"
@@ -533,7 +543,9 @@ class Prop(BaseModel):
         default_factory=list, description="道具别名（如 别称、俗称）"
     )
     description: str = Field(..., description="Visual description of the object")
-    prompt_en: str = Field("", description="English image-generation prompt (bilingual asset)")
+    prompt_en: str = Field(
+        "", description="English image-generation prompt (bilingual asset)"
+    )
     video_url: Optional[str] = None
     audio_url: Optional[str] = None
     sfx_url: Optional[str] = None

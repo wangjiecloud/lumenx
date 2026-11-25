@@ -17,6 +17,8 @@ from src.apps.comic_gen.models import (
     Prop,
     PromptConfig,
     ModelSettings,
+    GlobalAssetLibrary,
+    ImageVariant,
 )
 from src.apps.comic_gen.pipeline import (
     ComicGenPipeline,
@@ -43,8 +45,10 @@ def pipeline(tmp_path):
         p = ComicGenPipeline()
     p.data_file = str(tmp_path / "projects.json")
     p.series_data_file = str(tmp_path / "series.json")
+    p.library_data_file = str(tmp_path / "library.json")
     p.scripts = {}
     p.series_store = {}
+    p.library_store = GlobalAssetLibrary()
     return p
 
 
@@ -279,6 +283,166 @@ class TestEpisodeAssociation:
 # ===================================================================
 # 4. Asset resolution tests
 # ===================================================================
+
+
+class TestMergeSharedAssets:
+    def test_reparse_merges_matching_series_character_media(self, pipeline):
+        series = pipeline.create_series("Shared")
+        shared = _make_character("韩立")
+        shared.reference_sheet.image_variants.append(
+            ImageVariant(id="img_shared", url="uploads/hanli.png")
+        )
+        shared.reference_sheet.selected_image_id = "img_shared"
+        series.characters.append(shared)
+        pipeline._save_series_data()
+
+        episode = _make_script(title="Ep", series_id=series.id)
+        pipeline.scripts[episode.id] = episode
+        parsed = _make_script(
+            id=episode.id,
+            title="Ep",
+            series_id=series.id,
+            characters=[_make_character("韩立")],
+        )
+        pipeline.script_processor.parse_novel.return_value = parsed
+
+        pipeline.reparse_project(episode.id, "text")
+
+        # No duplicate local copy: the matched entity is dropped and the
+        # shared series asset is the single visible entry.
+        assert pipeline.scripts[episode.id].characters == []
+        resolved = pipeline.resolve_episode_assets(pipeline.scripts[episode.id])
+        merged = next(c for c in resolved["characters"] if c.name == "韩立")
+        assert merged.reference_sheet.image_variants[0].url == "uploads/hanli.png"
+
+    def test_reparse_merges_matching_global_asset(self, pipeline):
+        shared = _make_character("南宫婉")
+        shared.reference_sheet.image_variants.append(
+            ImageVariant(id="img_global", url="uploads/nangong.png")
+        )
+        shared.reference_sheet.selected_image_id = "img_global"
+        pipeline.library_store.characters.append(shared)
+
+        episode = _make_script()
+        pipeline.scripts[episode.id] = episode
+        parsed = _make_script(id=episode.id, characters=[_make_character("南宫婉")])
+        pipeline.script_processor.parse_novel.return_value = parsed
+
+        pipeline.reparse_project(episode.id, "text")
+
+        assert pipeline.scripts[episode.id].characters == []
+        resolved = pipeline.resolve_episode_assets(pipeline.scripts[episode.id])
+        merged = next(c for c in resolved["characters"] if c.name == "南宫婉")
+        assert merged.reference_sheet.image_variants[0].url == "uploads/nangong.png"
+
+
+class TestStyleReferenceSelection:
+    def test_delete_library_asset_variant(self, pipeline):
+        char = _make_character("A")
+        char.reference_sheet.image_variants = [
+            ImageVariant(id="v1", url="uploads/a.png"),
+            ImageVariant(id="v2", url="uploads/b.png"),
+        ]
+        char.reference_sheet.selected_image_id = "v1"
+        pipeline.library_store.characters.append(char)
+
+        pipeline.delete_library_asset_variant("character", char.id, "v1")
+
+        ids = [v.id for v in char.reference_sheet.image_variants]
+        assert ids == ["v2"]
+        assert char.reference_sheet.selected_image_id == "v2"
+        assert char.image_url == "uploads/b.png"
+
+    def test_delete_project_reference_sheet_clears_legacy_fallbacks(self, pipeline):
+        char = _make_character("A")
+        char.reference_sheet.image_variants = [
+            ImageVariant(id="v1", url="uploads/a.png"),
+        ]
+        char.reference_sheet.selected_image_id = "v1"
+        char.image_url = "uploads/a.png"
+        char.avatar_url = "uploads/a.png"
+        script = _make_script(characters=[char])
+        pipeline.scripts[script.id] = script
+
+        pipeline.delete_asset_variant(script.id, char.id, "character", "v1")
+
+        assert char.reference_sheet.image_variants == []
+        assert char.image_url is None
+        assert char.avatar_url is None
+
+    def test_prefers_series_then_global(self, pipeline, tmp_path):
+        f1 = tmp_path / "series.png"
+        f1.write_bytes(b"x")
+        series_char = _make_character("A")
+        series_char.reference_sheet.image_variants.append(
+            ImageVariant(id="v1", url=str(f1))
+        )
+        series_char.reference_sheet.selected_image_id = "v1"
+        series = pipeline.create_series("S")
+        series.characters.append(series_char)
+
+        f2 = tmp_path / "global.png"
+        f2.write_bytes(b"x")
+        global_char = _make_character("B")
+        global_char.reference_sheet.image_variants.append(
+            ImageVariant(id="v2", url=str(f2))
+        )
+        global_char.reference_sheet.selected_image_id = "v2"
+        pipeline.library_store.characters.append(global_char)
+
+        refs = pipeline.collect_style_reference_paths(
+            [series.characters, pipeline.library_store.characters], "character"
+        )
+        assert refs[0] == str(f1)
+        assert str(f2) in refs
+
+    def test_excludes_target_asset(self, pipeline, tmp_path):
+        f = tmp_path / "self.png"
+        f.write_bytes(b"x")
+        char = _make_character("A")
+        char.reference_sheet.image_variants.append(ImageVariant(id="v", url=str(f)))
+        char.reference_sheet.selected_image_id = "v"
+
+        refs = pipeline.collect_style_reference_paths(
+            [[char]], "character", exclude_id=char.id
+        )
+        assert refs == []
+
+    def test_infers_gender_from_name(self, pipeline):
+        assert pipeline._entity_gender_value(_make_character("韩母")) == "female"
+        assert pipeline._entity_gender_value(_make_character("老张叔")) == "male"
+
+    def test_style_refs_exclude_gender_mismatch(self, pipeline):
+        female = _make_character("韩母")
+        female.description = "中年农家妇人"
+        male = _make_character("韩立")
+        male.role = "主角"
+        male.gender = "male"
+        assert pipeline._filter_style_ref_candidates([male], female) == []
+
+    def test_style_refs_exclude_young_refs_for_elderly(self, pipeline):
+        elder = _make_character("韩母")
+        elder.description = "老妇人"
+        young = _make_character("南宫婉")
+        young.gender = "female"
+        young.role = "重要配角"
+        young.age = "18"
+        assert pipeline._filter_style_ref_candidates([young], elder) == []
+
+    def test_resolve_dedupes_by_name_across_layers(self, pipeline):
+        ep = _make_script()
+        ep.characters = [_make_character("韩立")]
+        shared = _make_character("韩立")
+        shared.reference_sheet.image_variants.append(
+            ImageVariant(id="img", url="uploads/hanli.png")
+        )
+        shared.reference_sheet.selected_image_id = "img"
+        pipeline.library_store.characters.append(shared)
+
+        resolved = pipeline.resolve_episode_assets(ep)
+
+        hanli = [c for c in resolved["characters"] if c.name == "韩立"]
+        assert len(hanli) == 1
 
 
 class TestResolveEpisodeAssets:

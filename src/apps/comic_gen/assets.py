@@ -21,8 +21,9 @@ logger = get_logger(__name__)
 # 角色形象审美化：网文原文常有“相貌普通/皮肤黑/不起眼”等描述，
 # 直接照搬会生成不符合影视审美的形象。这里统一加“帅美/精致/干净皮肤”前缀。
 _CHARACTER_QUALITY_TEMPLATE = (
-    "Chinese manhua 2D character design, {looks}, cel-shaded illustration, clean line art, "
-    "expressive eyes, ancient Chinese costume with fabric folds, detailed face, best quality,"
+    "Chinese 3D donghua character, cinematic semi-realistic render, {looks}, "
+    "ancient Chinese costume with fabric folds, realistic skin and hair, "
+    "expressive eyes, detailed face, Unreal Engine 5 style, best quality,"
 )
 _CHARACTER_EXTRA_NEGATIVE = (
     "ugly, plain unattractive face, deformed, asymmetric eyes, extra limbs, extra fingers, "
@@ -76,16 +77,22 @@ class AssetGenerator:
         self.model = WanxImageModel(self.config.get("model", {}))
         self._mulerouter_image_model = None
         self.output_dir = self.config.get("output_dir", "output/assets")
+        # Last effective prompt per character id, exposed to the workbench so
+        # the UI can show what was actually sent to the model.
+        self.last_prompts: Dict[str, Dict[str, Any]] = {}
 
     def _generate_with_qa(self, prompt, output_path, expectation, **gen_kwargs):
         """Generate an image, then run VLM QA; optionally regenerate with fix terms."""
         from .image_qa import auto_qa_enabled, auto_qa_regen_enabled, verify_image
 
+        style_ref_paths = gen_kwargs.pop("style_ref_paths", None)
         negative = gen_kwargs.get("negative_prompt") or ""
         attempts = 2 if auto_qa_regen_enabled() else 1
         image_path = None
         for attempt in range(attempts):
             gen_kwargs["negative_prompt"] = negative
+            if style_ref_paths:
+                gen_kwargs["ref_image_paths"] = style_ref_paths
             image_path, _ = self._get_model_for(gen_kwargs.get("model_name")).generate(
                 prompt, output_path, **gen_kwargs
             )
@@ -101,6 +108,122 @@ class AssetGenerator:
             if fix:
                 negative = (negative + ", " + fix).strip(", ")
         return image_path
+
+    def _crop_head_reference(self, image_path: str) -> str:
+        """Crop a full-body render to a head/shoulders reference for the
+        headshot img2img pass. Using the uncropped full body with high
+        ref_strength makes the model reproduce a full-body composition even
+        when the prompt asks for a close-up."""
+        if not image_path or not os.path.exists(image_path):
+            return image_path
+        try:
+            from PIL import Image
+
+            im = Image.open(image_path).convert("RGB")
+            w, h = im.size
+            box = (int(w * 0.18), 0, int(w * 0.82), int(h * 0.46))
+            crop = im.crop(box)
+            if crop.width < 512:
+                scale = 512 / max(1, crop.width)
+                crop = crop.resize((int(crop.width * scale), int(crop.height * scale)))
+            out = f"{image_path.rsplit('.', 1)[0]}_headref.png"
+            crop.save(out)
+            return out
+        except Exception as e:
+            logger.warning("Failed to crop head reference: %s", e)
+            return image_path
+
+    def _infer_disposition(self, character) -> str:
+        """长期气质/面相倾向（不是临时表情）。
+
+        Extraction intentionally omits facial expressions, so we infer a
+        default from name/description/role. Family elders default to 和蔼;
+        villains to 阴险; otherwise neutral/upright.
+        """
+        name = getattr(character, "name", "") or ""
+        blob = f"{name} {getattr(character, 'description', '') or ''} {getattr(character, 'clothing', '') or ''}"
+        role = (getattr(character, "role", "") or "").strip()
+        if any(
+            k in name for k in ("母", "父", "娘", "婶", "婆", "奶", "爷", "亲", "姨")
+        ):
+            return "kind"
+        if any(
+            k in blob
+            for k in ("和蔼", "慈祥", "温和", "善良", "慈爱", "憨厚", "老实", "亲切")
+        ):
+            return "kind"
+        if any(
+            k in blob
+            for k in (
+                "阴险",
+                "狡诈",
+                "狠毒",
+                "冷酷",
+                "阴鸷",
+                "邪恶",
+                "魔道",
+                "反派",
+                "杀意",
+                "凶残",
+            )
+        ):
+            return "sinister"
+        if any(k in blob for k in ("威严", "刚正", "正气", "庄重", "凛然")):
+            return "dignified"
+        if role == "主角":
+            return "upright"
+        return "neutral"
+
+    def _disposition_anchors(self, disposition: str) -> tuple:
+        if disposition == "kind":
+            return (
+                "kind gentle benevolent expression, warm soft eyes, gentle friendly smile, "
+                "motherly/kind-hearted face, soft natural facial features",
+                "sinister, evil grin, menacing, villainous, cruel, harsh angry face, sharp eyebrows",
+            )
+        if disposition == "sinister":
+            return (
+                "sinister sly expression, narrow cold eyes, subtle evil smirk, cunning face",
+                "kind, friendly smile, innocent",
+            )
+        if disposition == "dignified":
+            return (
+                "dignified upright expression, calm firm gaze, composed serious face",
+                "sinister, evil grin, villainous, menacing",
+            )
+        if disposition == "upright":
+            return (
+                "honest upright expression, calm confident gaze, natural friendly face",
+                "sinister, evil grin, villainous, menacing, cruel",
+            )
+        return (
+            "calm neutral friendly expression, natural relaxed face",
+            "sinister, evil grin, menacing",
+        )
+
+    def _clothing_anchors(self, character) -> tuple:
+        blob = f"{getattr(character, 'clothing', '') or ''} {getattr(character, 'description', '') or ''}"
+        if any(
+            k in blob
+            for k in (
+                "农家",
+                "农妇",
+                "村民",
+                "朴素",
+                "粗布",
+                "布衣",
+                "平民",
+                "妇人",
+                "村妇",
+            )
+        ):
+            return (
+                "wearing simple coarse linen peasant clothes, plain rural Chinese hanfu, "
+                "cloth belt, humble village woman outfit, no jewelry",
+                "ball gown, evening dress, wedding dress, noble robe, luxurious costume, "
+                "ornate jewelry, earrings, tiara, crown, western dress, Victorian dress",
+            )
+        return ("", "")
 
     def _get_model_for(self, model_name: str) -> "ImageGenModel":
         """Route to the correct image adapter based on model name."""
@@ -127,6 +250,7 @@ class AssetGenerator:
         model_name: str = None,
         i2i_model_name: str = None,
         size: str = None,
+        reference_image_paths: list = None,
     ) -> Character:
         """
         Generates character assets based on generation_type.
@@ -135,6 +259,68 @@ class AssetGenerator:
         character.status = GenerationStatus.PROCESSING
 
         gender = (getattr(character, "gender", "") or "").lower()
+        # Gender is often missing from extraction. Infer it from the name /
+        # description so female characters don't drift to a male face under
+        # the 3D style (e.g. 韩母 with no gender field → old man with beard).
+        if not gender:
+            _name = getattr(character, "name", "") or ""
+            _blob = f"{_name} {getattr(character, 'description', '') or ''} {getattr(character, 'clothing', '') or ''}"
+            if any(
+                k in _name
+                for k in (
+                    "母",
+                    "妇",
+                    "娘",
+                    "姐",
+                    "妹",
+                    "婆",
+                    "姑",
+                    "女",
+                    "妻",
+                    "妃",
+                    "后",
+                    "公主",
+                    "侍女",
+                )
+            ):
+                gender = "female"
+            elif any(
+                k in _name
+                for k in (
+                    "父",
+                    "公",
+                    "爷",
+                    "叔",
+                    "伯",
+                    "兄",
+                    "弟",
+                    "男",
+                    "汉",
+                    "夫",
+                    "和尚",
+                    "道士",
+                )
+            ):
+                gender = "male"
+            elif any(
+                k in _blob
+                for k in (
+                    "妇人",
+                    "妇女",
+                    "女子",
+                    "少女",
+                    "女人",
+                    "妻子",
+                    "母亲",
+                    "姑娘",
+                    "她",
+                )
+            ):
+                gender = "female"
+            elif any(
+                k in _blob for k in ("男子", "少年", "男人", "丈夫", "父亲", "他")
+            ):
+                gender = "male"
         import re as _re
 
         _age_match = _re.search(r"\d+", str(getattr(character, "age", "") or ""))
@@ -153,10 +339,117 @@ class AssetGenerator:
             plain_look = "young woman" if _young else "woman"
         else:
             plain_look = "person"
+
+        # Infer age when the extraction left it blank, then add explicit age
+        # anchors. Without these, SDXL/IP-Adapter drifts to a young attractive
+        # face even when the description says 中年/老妇.
+        _desc_blob = f"{getattr(character, 'description', '') or ''} {getattr(character, 'clothing', '') or ''}"
+        age_value = _age
+        if age_value is None:
+            if any(k in _desc_blob for k in ("孩童", "小孩", "幼童")):
+                age_value = 10
+            elif any(k in _desc_blob for k in ("少女", "少年", "青年", "小伙", "姑娘")):
+                age_value = 20
+            elif any(
+                k in _desc_blob
+                for k in ("中年", "妇人", "妇女", "农夫", "农妇", "大叔", "大婶")
+            ):
+                age_value = 45
+            elif any(
+                k in _desc_blob
+                for k in (
+                    "老年",
+                    "老妇",
+                    "老头",
+                    "老者",
+                    "老翁",
+                    "老婆婆",
+                    "苍老",
+                    "年长",
+                    "年迈",
+                    "花白",
+                    "白发",
+                    "银发",
+                    "老丈",
+                    "老汉",
+                    "老先生",
+                )
+            ):
+                age_value = 65
+        age_positive = ""
+        age_negative = ""
+        if "女" in gender or "female" in gender:
+            age_gender_word = "woman"
+        elif "男" in gender or "male" in gender:
+            age_gender_word = "man"
+        else:
+            age_gender_word = "person"
+        if age_value is not None and age_value >= 60:
+            age_positive = (
+                f"elderly {age_gender_word}, 60s-70s, grey or white hair, deep age lines, "
+                "weathered wrinkled skin, aged plain features"
+            )
+            age_negative = (
+                "young, youthful, teenager, baby face, smooth flawless skin, "
+                "idol, glamorous, heavy makeup, beauty filter"
+            )
+        elif age_value is not None and age_value >= 40:
+            age_positive = (
+                f"middle-aged {age_gender_word}, 40s-50s, mature face, subtle wrinkles, "
+                "weathered sun-tanned skin, plain rustic features"
+            )
+            age_negative = (
+                "young, youthful, teenager, baby face, smooth flawless skin, "
+                "idol, glamorous, heavy makeup, beauty filter, delicate model face"
+            )
+        elif age_value is not None and age_value <= 16:
+            age_positive = "teenager, youthful, soft features"
+            age_negative = "adult, mature face, wrinkles, beard, stubble"
+
+        raw_disposition = (getattr(character, "disposition", "") or "").strip()
+        if any(
+            k in raw_disposition
+            for k in ("和蔼", "温和", "慈祥", "善良", "慈爱", "亲切")
+        ):
+            disposition = "kind"
+        elif any(
+            k in raw_disposition for k in ("阴险", "冷酷", "狡诈", "狠毒", "邪恶")
+        ):
+            disposition = "sinister"
+        elif any(k in raw_disposition for k in ("刚正", "威严", "庄重", "凛然")):
+            disposition = "dignified"
+        else:
+            disposition = self._infer_disposition(character)
+        disposition_positive, disposition_negative = self._disposition_anchors(
+            disposition
+        )
+        clothing_positive, clothing_negative = self._clothing_anchors(character)
+        _blob_all = f"{getattr(character, 'description', '') or ''} {getattr(character, 'clothing', '') or ''}"
+        if any(
+            k in _blob_all
+            for k in ("金发", "碧眼", "西域", "异族", "洋人", "西式", "欧洲")
+        ):
+            ethnicity_positive, ethnicity_negative = "", ""
+        else:
+            ethnicity_positive = (
+                "Chinese East Asian person, East Asian facial features, black hair"
+            )
+            ethnicity_negative = (
+                "caucasian, western, european, blonde hair, blue eyes, western costume"
+            )
+
+        role_negative = ""
+        if role in ("龙套", "群演", "路人"):
+            role_negative = (
+                "glamorous idol, supermodel, heavy makeup, ornate jewelry, "
+                "luxurious costume, delicate doll face, fashion model"
+            )
         if "男" in gender or "male" in gender:
-            gender_anchor = "1 male man"
+            gender_anchor = "1 adult male man"
         elif "女" in gender or "female" in gender:
-            gender_anchor = "1 female woman"
+            gender_anchor = (
+                "1 adult female woman, feminine face, soft jawline, no facial hair"
+            )
         else:
             gender_anchor = "1 person"
         if role in ("主角", "重要配角"):
@@ -164,8 +457,8 @@ class AssetGenerator:
             extra_negative = _CHARACTER_EXTRA_NEGATIVE
         elif role in ("龙套", "群演", "路人"):
             quality_prefix = (
-                f"Chinese manhua 2D background villager, ordinary plain-faced {plain_look}, "
-                "simple ancient clothing, clean line art,"
+                f"Chinese 3D donghua background villager, ordinary plain-faced {plain_look}, "
+                "simple ancient clothing, cinematic semi-realistic render,"
             )
             extra_negative = (
                 "deformed, asymmetric eyes, extra limbs, extra fingers, bad anatomy, "
@@ -173,8 +466,8 @@ class AssetGenerator:
             )
         else:
             quality_prefix = (
-                f"Chinese manhua 2D character, {looks}, cel shading, clean line art, "
-                "natural proportions, ancient Chinese costume, detailed face,"
+                f"Chinese 3D donghua character, ordinary {plain_look}, cinematic semi-realistic render, "
+                "natural proportions, ancient Chinese costume, realistic skin and hair, detailed face,"
             )
             extra_negative = _CHARACTER_EXTRA_NEGATIVE
         # IMPORTANT: gender guards must come FIRST — SDXL truncates prompts at
@@ -186,11 +479,19 @@ class AssetGenerator:
                 "flower hair ornament, hairpin, long eyelashes, delicate features"
             )
         elif "女" in gender or "female" in gender:
-            gender_negative = "male, man, beard, masculine jaw, stubble"
+            gender_negative = (
+                "male, man, boy, beard, mustache, moustache, five o'clock shadow, "
+                "stubble, masculine jaw, adam's apple, male pattern baldness"
+            )
         negative_prompt = ", ".join(
             part
             for part in (
                 gender_negative,
+                age_negative,
+                ethnicity_negative,
+                clothing_negative,
+                disposition_negative,
+                role_negative,
                 "multiple people, two people, group, crowd, duplicate, clone, split screen",
                 extra_negative,
                 negative_prompt,
@@ -222,8 +523,121 @@ class AssetGenerator:
                     effective_prompt = f"{positive_prompt}, {effective_prompt}"
                 if not effective_prompt.startswith(gender_anchor):
                     effective_prompt = f"{gender_anchor}, {effective_prompt}"
+                if age_positive and age_positive not in effective_prompt:
+                    effective_prompt = f"{age_positive}, {effective_prompt}"
+                if (
+                    disposition_positive
+                    and disposition_positive not in effective_prompt
+                ):
+                    effective_prompt = f"{disposition_positive}, {effective_prompt}"
+                if ethnicity_positive and ethnicity_positive not in effective_prompt:
+                    effective_prompt = f"{ethnicity_positive}, {effective_prompt}"
+                if clothing_positive and clothing_positive not in effective_prompt:
+                    effective_prompt = f"{clothing_positive}, {effective_prompt}"
 
-                effective_size = size or "1024*1024"
+                # Framing must come first — local SDXL truncates long prompts,
+                # and composition instructions at the end get dropped, which is
+                # why results were cropped half-faces.
+                lower_prompt = effective_prompt.lower()
+                is_closeup = any(
+                    k in lower_prompt
+                    for k in ("close-up", "close up", "headshot", "头像")
+                )
+                if is_closeup:
+                    framing = (
+                        "head and shoulders close-up, entire face fully inside the frame, "
+                        "no cropping"
+                    )
+                    crop_negative = (
+                        "cropped face, face out of frame, half face, cut off head"
+                    )
+                else:
+                    framing = (
+                        "single character, full body from head to toe, entire subject fully "
+                        "inside the frame, centered with generous margins, no cropping"
+                    )
+                    crop_negative = (
+                        "cropped, cut off, out of frame, partial body, half body, "
+                        "missing head, missing feet, head cut off, feet cut off, zoomed face only"
+                    )
+                effective_prompt = f"{framing}, {effective_prompt}"
+                if crop_negative not in negative_prompt:
+                    negative_prompt = f"{crop_negative}, {negative_prompt}"
+
+                # Local SDXL truncates prompts (~77 tokens). A long assembled
+                # prompt drops the 3D style + age at the tail, producing a young
+                # 2D illustration. For local backends, send a compact prompt
+                # with the critical anchors first and only the short entity
+                # prompt appended.
+                try:
+                    from ...models.local import local_enabled
+
+                    local_image = local_enabled("image")
+                except Exception:
+                    local_image = False
+                if local_image:
+                    if age_value is not None and age_value >= 60:
+                        age_short = "elderly, 60s-70s, white or grey hair, deep wrinkles, aged face"
+                    elif age_value is not None and age_value >= 40:
+                        age_short = "middle-aged, 40s-50s, mature wrinkled face"
+                    elif age_value is not None and age_value <= 16:
+                        age_short = "teenager"
+                    else:
+                        age_short = "young adult"
+                    disp_short = {
+                        "kind": "kind gentle face, warm eyes, gentle smile",
+                        "sinister": "sinister face, narrow cold eyes",
+                        "dignified": "dignified composed face",
+                        "upright": "honest upright face, calm gaze",
+                        "neutral": "natural friendly face",
+                    }.get(disposition, "natural friendly face")
+                    clothing_short = (
+                        clothing_positive.split(",")[0] if clothing_positive else ""
+                    )
+                    compact_parts = [
+                        "Chinese 3D donghua cinematic render",
+                        "single character, full body from head to toe, centered, no crop",
+                        f"East Asian Chinese {age_gender_word}",
+                        age_short,
+                        disp_short,
+                        clothing_short,
+                    ]
+                    effective_prompt = ", ".join(p for p in compact_parts if p)
+                    if getattr(character, "prompt_en", None):
+                        effective_prompt += f", {character.prompt_en[:100]}"
+                    compact_negative = ", ".join(
+                        p
+                        for p in (
+                            "multiple panels, collage, split screen, character sheet, "
+                            "grid of faces, text, watermark, signature, border",
+                            crop_negative,
+                            "male, man, beard, mustache, caucasian, western, blonde, "
+                            "blue eyes, young, baby face, ball gown, jewelry, 2D, "
+                            "illustration, anime, cel shading",
+                            "low quality, blurry, deformed, extra limbs, bad anatomy",
+                        )
+                        if p
+                    )
+                    negative_prompt = compact_negative
+
+                logger.info(
+                    "Reference sheet prompt [%s]: %s",
+                    character.name,
+                    effective_prompt[:600],
+                )
+                logger.info(
+                    "Reference sheet negative [%s]: %s",
+                    character.name,
+                    negative_prompt[:400],
+                )
+                self.last_prompts[character.id] = {
+                    "positive": effective_prompt,
+                    "negative": negative_prompt,
+                    "size": size or "576*1024",
+                    "local": bool(local_image),
+                }
+
+                effective_size = size or "576*1024"
 
                 successful_generations = 0
                 last_error = ""
@@ -244,6 +658,7 @@ class AssetGenerator:
                             negative_prompt=negative_prompt,
                             model_name=model_name,
                             size=effective_size,
+                            style_ref_paths=reference_image_paths,
                         )
 
                         rel_path = os.path.relpath(sheet_path, "output")
@@ -782,9 +1197,9 @@ class AssetGenerator:
                             generation_prompt,
                             avatar_path,
                             f"{character.name}: {character.prompt_en or character.description}",
-                            ref_image_path=fullbody_path,
+                            ref_image_path=self._crop_head_reference(fullbody_path),
                             negative_prompt=negative_prompt,
-                            ref_strength=0.8,
+                            ref_strength=0.55,
                             model_name=i2i_model_name,
                         )
 
@@ -886,6 +1301,7 @@ class AssetGenerator:
         batch_size: int = 1,
         model_name: str = None,
         size: str = None,
+        reference_image_paths: list = None,
     ) -> Scene:
         """Generates a scene reference image."""
         scene.status = GenerationStatus.PROCESSING
@@ -916,7 +1332,7 @@ class AssetGenerator:
             scene_style = scene_style.replace(_bad, "")
         scene_style = scene_style[:180]
         prompt = (
-            f"2D Chinese manhua background art, grand xianxia immortal realm, floating mountains, "
+            f"Cinematic 3D donghua environment, semi-realistic render, grand xianxia immortal realm, floating mountains, "
             f"celestial palaces, glowing spell arrays, talismans, spirit qi, mist, "
             f"ancient Chinese architecture, timber-frame, tiled roof, paper windows, "
             f"no tatami, no shoji, no kimono. "
@@ -957,6 +1373,11 @@ class AssetGenerator:
                         negative_prompt=gen_negative,
                         model_name=model_name,
                         size=effective_size,
+                        **(
+                            {"ref_image_paths": reference_image_paths}
+                            if reference_image_paths
+                            else {}
+                        ),
                     )
                     if not auto_qa_enabled():
                         break
@@ -1028,6 +1449,7 @@ class AssetGenerator:
         batch_size: int = 1,
         model_name: str = None,
         size: str = None,
+        reference_image_paths: list = None,
     ) -> Prop:
         """Generates a prop reference image."""
         prop.status = GenerationStatus.PROCESSING
@@ -1069,6 +1491,11 @@ class AssetGenerator:
                     negative_prompt=negative_prompt,
                     model_name=model_name,
                     size=effective_size,
+                    **(
+                        {"ref_image_paths": reference_image_paths}
+                        if reference_image_paths
+                        else {}
+                    ),
                 )
 
                 rel_path = os.path.relpath(output_path, "output")

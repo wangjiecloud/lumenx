@@ -267,6 +267,8 @@ DEFAULT_ENTITY_EXTRACTION_PROMPT = """
 重要：
 - 所有描述性内容（名称、描述）必须使用中文（简体中文）。
 - 只提取角色（characters）、场景（scenes）和道具（props）。
+- **完整性优先**：原文中出现过的所有有名有姓的角色、明确地点/场景、关键道具都必须提取，不得遗漏；不要因为戏份少就省略。
+- **禁止概括**：描述必须聚焦可复现的外形/材质/环境细节，但不要丢失原文明确给出的设定。
 - **正名与别名**：`name` 一律填“正名/本名”。凡是文本中出现的化名、对外宣称的名字、绰号、昵称、尊称、道号、小名，全部放进 `aliases` 数组。
   例如：韩立对外宣称叫“厉飞雨”，乡亲叫他“二愣子”，人送外号“韩老魔” →
   name = "韩立"，aliases = ["二愣子", "厉飞雨", "韩老魔"]。
@@ -274,6 +276,7 @@ DEFAULT_ENTITY_EXTRACTION_PROMPT = """
   场景/道具如果有别称，也放入对应 aliases。
 - **角色定位 role**：主角（贯穿全篇的核心人物，如韩立）/ 重要配角（反复出现、有名字、推动剧情）/ 配角 / 龙套（村民甲、路人等一次性角色）。
   并按 role 设置 visual_weight：主角 5、重要配角 4、配角 3、龙套 1-2。
+- **长期气质 disposition**：根据文本判断角色的长期气质/面相倾向，如 和蔼、温和、刚正、威严、阴险、冷酷、狡黠、木讷、普通。只写长期气质，不要写临时表情（悲伤/愤怒/大笑）。主角的亲人/长辈（如韩母）应偏向和蔼/温和；魔道/反派偏向阴险/冷酷；无法判断时填 "普通"。
 - **prompt_en**：为每个角色/场景/道具额外输出一条英文图像生成提示词，保留专名音译，用通用英文服饰/器物词，不要把中文整段翻译成句子。
 
 严格按以下结构输出合法 JSON：
@@ -284,6 +287,7 @@ DEFAULT_ENTITY_EXTRACTION_PROMPT = """
             "name": "角色正名（如 '叶墨'）",
             "aliases": ["别名/化名/昵称，如 '厉飞雨'、'二愣子'"],
             "role": "主角 | 重要配角 | 配角 | 龙套",
+            "disposition": "和蔼 | 温和 | 刚正 | 威严 | 阴险 | 冷酷 | 狡黠 | 木讷 | 普通",
             "prompt_en": "英文图像提示词：外观/服装/发型/材质，40-80词，逗号分隔，不要解释",
             "description": "外观描述（发型、眼睛、体型、显著特征）。不要包含具体的面部表情（如 悲伤、愤怒）或临时动作（如 奔跑、哭泣）。聚焦于长期固定的外形特征。",
             "age": "年龄估计（如 '25'）",
@@ -368,6 +372,9 @@ DEFAULT_STORYBOARD_EXTRACTION_PROMPT = """# 角色
 6. **角度枚举**: 必须从以下选项中选择: 平视 | 俯视 | 仰视 | 鸟瞰 | 蚁视 | 过肩 | 荷兰角 | 主观视角
 7. **时长**: 基于动作复杂度估算整数秒（范围 3-10 秒）。简单静态 3-4s，标准动作 5-6s，复杂/情绪镜头 7-10s。
 8. **对白**: 如果帧中有角色说话，dialogue 和 speaker 必须填写。一帧只能有一个说话人——多人对话必须拆为多帧。
+9. **对白完整性（硬性）**: 原文中的每一句对白都必须完整出现在某一帧的 `dialogue` 中，不得合并、省略、改写或摘要；多人对话按说话人拆帧也要全部保留。宁可增加帧数，也不能丢台词。
+10. **情节完整性（硬性）**: 不得跳过任何情节、动作或场景转换；按原文顺序覆盖全部内容。禁止“概要式分镜”。
+11. **细节保留（硬性）**: 保留原文中明确出现的关键动作、物品、神态、环境与因果细节，不得用“发生战斗”“众人交谈”等概括词替代。
 
 # 剧本格式说明
 - **场景标题行**: `1-1 地点名称 [时间] [内/外]`
@@ -442,7 +449,11 @@ class ScriptProcessor:
         return self.llm.is_configured
 
     def parse_novel(
-        self, title: str, text: str, custom_extraction_prompt: str = ""
+        self,
+        title: str,
+        text: str,
+        custom_extraction_prompt: str = "",
+        world_context: str = "",
     ) -> Script:
         """
         Parses the raw novel text into a structured Script object using an LLM.
@@ -460,6 +471,11 @@ class ScriptProcessor:
             )
 
         prompt = self._construct_prompt(text, custom_extraction_prompt)
+        if world_context.strip():
+            prompt += (
+                "\n\n# 世界观设定（必须严格遵循，角色/场景/道具需符合以下时代、服饰、建筑与视觉锚点）\n"
+                f"{world_context.strip()}"
+            )
 
         try:
             content = self.llm.chat(
@@ -504,6 +520,7 @@ class ScriptProcessor:
                 name=char_data.get("name", "Unknown"),
                 aliases=_clean_aliases(char_data.get("aliases")),
                 role=(str(char_data.get("role") or "配角").strip() or "配角"),
+                disposition=(str(char_data.get("disposition") or "").strip() or None),
                 prompt_en=(char_data.get("prompt_en") or ""),
                 description=char_data.get("description", ""),
                 age=char_data.get("age"),
@@ -1021,6 +1038,8 @@ class ScriptProcessor:
         text: str,
         entities_json: Dict[str, Any],
         custom_extraction_prompt: str = "",
+        world_context: str = "",
+        previous_context: str = "",
     ) -> List[Dict[str, Any]]:
         """
         Analyzes script text and generates storyboard frames using Prompt B (Storyboard Director).
@@ -1059,6 +1078,16 @@ class ScriptProcessor:
         system_prompt = template.replace("{entities_str}", entities_str).replace(
             "{text}", text
         )
+        if world_context.strip():
+            system_prompt += (
+                "\n\n# 世界观设定（必须严格遵循：时代、地理、宗门、建筑、服饰、视觉风格）\n"
+                f"{world_context.strip()}"
+            )
+        if previous_context.strip():
+            system_prompt += (
+                "\n\n# 上一集衔接（保持人物关系、场景、时间线与视觉风格连续，不得与上文矛盾）\n"
+                f"{previous_context.strip()}"
+            )
 
         try:
             content = self.llm.chat(

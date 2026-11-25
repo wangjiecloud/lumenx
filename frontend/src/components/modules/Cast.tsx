@@ -22,6 +22,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Users, MapPin, Box, AlertTriangle, Sparkles, Plus, Upload, X, Loader2, Play, Pause, Volume2, Wand2, Layers, Maximize2 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { useProjectStore } from "@/store/projectStore";
+import { toast } from "@/store/toastStore";
 import { api } from "@/lib/api";
 import { getAssetUrl } from "@/lib/utils";
 import { useLightbox } from "@/components/shared/preview/LightboxProvider";
@@ -169,6 +170,96 @@ export default function Cast() {
     }, [currentProject?.frames, currentProject?.characters, currentProject?.scenes, currentProject?.props]);
 
     const totalCast = characters.length + scenes.length + props.length;
+    const updateProject = useProjectStore((state) => state.updateProject);
+    const [batchBusy, setBatchBusy] = useState(false);
+    const batchPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    useEffect(() => () => {
+        if (batchPollRef.current) {
+            clearInterval(batchPollRef.current);
+            batchPollRef.current = null;
+        }
+    }, []);
+
+    const missingCast = [...characters, ...scenes, ...props].filter((i) => i.status !== "ready");
+
+    const entitySource = (item: CastItem): string | undefined => {
+        const pool = item.kind === "character"
+            ? currentProject?.characters
+            : item.kind === "scene"
+                ? currentProject?.scenes
+                : currentProject?.props;
+        return (pool as any[] | undefined)?.find((e: any) => e.id === item.id)?.source;
+    };
+
+    const handleGenerateMissing = async () => {
+        if (!currentProject || batchBusy) return;
+        const targets = missingCast.map((item) => ({ item, source: entitySource(item) }));
+        const local = targets.filter((t) => t.source !== "global");
+        const globalCount = targets.length - local.length;
+        if (local.length === 0) {
+            toast.info(t("batchNone"));
+            return;
+        }
+        if (!window.confirm(t("batchConfirm", { count: local.length }))) return;
+        if (globalCount > 0) toast.info(t("batchSkipGlobal", { count: globalCount }));
+
+        setBatchBusy(true);
+        const styleConfig: any = (currentProject as any).art_direction?.style_config || {};
+        const stylePreset = currentProject.style_preset || "realistic";
+        const stylePositive = styleConfig.positive_prompt || "";
+        const styleNegative = styleConfig.negative_prompt || "";
+        const taskIds: string[] = [];
+
+        for (const { item, source } of local) {
+            const generationType = item.kind === "character" ? "reference_sheet" : "all";
+            try {
+                const resp = source === "series" && currentProject.series_id
+                    ? await api.seriesGenerateAsset(
+                        currentProject.series_id, item.id, item.kind,
+                        stylePreset, stylePositive, generationType, "",
+                        true, styleNegative, 1,
+                        currentProject.model_settings?.t2i_model,
+                    )
+                    : await api.generateAsset(
+                        currentProject.id, item.id, item.kind,
+                        stylePreset, stylePositive, generationType, "",
+                        true, styleNegative, 1,
+                        currentProject.model_settings?.t2i_model,
+                    );
+                const taskId = (resp as any)?._task_id;
+                if (taskId) taskIds.push(taskId);
+            } catch (err) {
+                console.error("Batch asset generation failed for", item.name, err);
+            }
+        }
+
+        if (taskIds.length === 0) {
+            setBatchBusy(false);
+            toast.error(t("batchNone"));
+            return;
+        }
+        toast.success(t("batchQueued", { count: taskIds.length }));
+
+        const startedAt = Date.now();
+        batchPollRef.current = setInterval(async () => {
+            try {
+                const statuses = await Promise.all(
+                    taskIds.map((id) => api.getTaskStatus(id).catch(() => null)),
+                );
+                const terminal = statuses.every((s: any) =>
+                    !s || ["completed", "failed", "canceled"].includes(s.status),
+                );
+                if (terminal || Date.now() - startedAt > 30 * 60 * 1000) {
+                    if (batchPollRef.current) clearInterval(batchPollRef.current);
+                    batchPollRef.current = null;
+                    const fresh = await api.getProject(currentProject.id);
+                    updateProject(currentProject.id, fresh);
+                    setBatchBusy(false);
+                    toast.success(t("batchDone"));
+                }
+            } catch { /* keep polling */ }
+        }, 4000);
+    };
 
     return (
         <div className="flex h-full w-full flex-col overflow-hidden">
@@ -242,6 +333,17 @@ export default function Cast() {
                                 )}
                             </button>
                         ))}
+                        <button
+                            onClick={handleGenerateMissing}
+                            disabled={batchBusy || missingCast.length === 0}
+                            className="ml-auto mb-2 inline-flex items-center gap-1.5 rounded-full bg-primary/15 px-3 py-1.5 text-[0.6875rem] font-semibold text-primary transition-colors hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-40"
+                            title={t("batchHint")}
+                        >
+                            {batchBusy ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                            {batchBusy
+                                ? t("batchGenerating")
+                                : `${t("batchGenerate")}${missingCast.length > 0 ? ` (${missingCast.length})` : ""}`}
+                        </button>
                     </div>
 
                     <div className="flex-1 overflow-y-auto bg-surface px-8 py-6 space-y-10 custom-scrollbar">
@@ -726,6 +828,30 @@ function CastCard({ item, onOpenWorkbench }: { item: CastItem; onOpenWorkbench?:
         }
     };
 
+    // Role editing — routes to the asset's owning layer (episode / series /
+    // global) so 角色定位 still drives generation for every role tier.
+    const handleRoleChange = async (newRole: string) => {
+        if (!currentProject || !character) return;
+        const source = (character as any).source;
+        try {
+            if (source === "series" && currentProject.series_id) {
+                await api.updateSeriesAssetAttributes(
+                    currentProject.series_id, character.id, "character", { role: newRole },
+                );
+            } else if (source === "global") {
+                await api.updateLibraryAsset("character", character.id, { role: newRole });
+            } else {
+                await api.updateAssetAttributes(
+                    currentProject.id, character.id, "character", { role: newRole },
+                );
+            }
+            const updated = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, updated);
+        } catch (e) {
+            console.error("Failed to update character role:", e);
+        }
+    };
+
     // PR-3g · inline preview from CastCard (uses currently-bound voice)
     const handleInlinePreview = async () => {
         if (!voiceId) return;
@@ -897,13 +1023,22 @@ function CastCard({ item, onOpenWorkbench }: { item: CastItem; onOpenWorkbench?:
                         <p className="truncate font-sans text-[0.8125rem] font-medium text-foreground" title={item.name}>
                             {item.name}
                         </p>
-                        {item.role && (
-                            <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[0.5625rem] font-medium ${
-                                item.role === "主角" ? "bg-primary/15 text-primary" :
-                                item.role === "重要配角" ? "bg-amber-400/15 text-amber-300" :
-                                "bg-glass text-text-muted"}`}>
-                                {item.role}
-                            </span>
+                        {item.kind === "character" && (
+                            <select
+                                value={item.role || "配角"}
+                                onChange={(e) => { e.stopPropagation(); handleRoleChange(e.target.value); }}
+                                onClick={(e) => e.stopPropagation()}
+                                className={`shrink-0 cursor-pointer rounded-full border-0 px-1.5 py-0.5 text-[0.5625rem] font-medium outline-none ${
+                                    item.role === "主角" ? "bg-primary/15 text-primary" :
+                                    item.role === "重要配角" ? "bg-amber-400/15 text-amber-300" :
+                                    "bg-glass text-text-muted"}`}
+                                title={t("roleLabel")}
+                            >
+                                <option value="主角">主角</option>
+                                <option value="重要配角">重要配角</option>
+                                <option value="配角">配角</option>
+                                <option value="龙套">龙套</option>
+                            </select>
                         )}
                     </div>
                     <div className="flex items-center justify-between gap-1">

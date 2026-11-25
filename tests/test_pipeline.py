@@ -13,7 +13,12 @@ import pytest
 from unittest.mock import patch
 
 from src.apps.comic_gen.models import (
-    Script, Character, Scene, StoryboardFrame, GenerationStatus,
+    Script,
+    Character,
+    Scene,
+    StoryboardFrame,
+    GenerationStatus,
+    GlobalAssetLibrary,
 )
 from src.apps.comic_gen.pipeline import ComicGenPipeline
 
@@ -22,21 +27,25 @@ from src.apps.comic_gen.pipeline import ComicGenPipeline
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def pipeline(tmp_path):
     """Create a pipeline with temp data files, bypassing real IO."""
-    with patch("src.apps.comic_gen.pipeline.ScriptProcessor"), \
-         patch("src.apps.comic_gen.pipeline.AssetGenerator"), \
-         patch("src.apps.comic_gen.pipeline.StoryboardGenerator"), \
-         patch("src.apps.comic_gen.pipeline.VideoGenerator"), \
-         patch("src.apps.comic_gen.pipeline.AudioGenerator"), \
-         patch("src.apps.comic_gen.pipeline.ExportManager"):
+    with (
+        patch("src.apps.comic_gen.pipeline.ScriptProcessor"),
+        patch("src.apps.comic_gen.pipeline.AssetGenerator"),
+        patch("src.apps.comic_gen.pipeline.StoryboardGenerator"),
+        patch("src.apps.comic_gen.pipeline.VideoGenerator"),
+        patch("src.apps.comic_gen.pipeline.AudioGenerator"),
+        patch("src.apps.comic_gen.pipeline.ExportManager"),
+    ):
         p = ComicGenPipeline()
     p.data_file = str(tmp_path / "projects.json")
     p.series_data_file = str(tmp_path / "series.json")
     p.library_data_file = str(tmp_path / "library_assets.json")
     p.scripts = {}
     p.series_store = {}
+    p.library_store = GlobalAssetLibrary()
     return p
 
 
@@ -44,12 +53,13 @@ def _make_parsed_script() -> Script:
     """Build the Script that a real ScriptProcessor.parse_novel would return
     for the original smoke-test novel text."""
     now = time.time()
-    alex = Character(id=str(uuid.uuid4()), name="Alex",
-                     description="An explorer in the ruins")
-    luna = Character(id=str(uuid.uuid4()), name="Luna",
-                     description="A mysterious girl")
-    ruins = Scene(id=str(uuid.uuid4()), name="Ancient Ruins",
-                  description="Crumbling stone halls")
+    alex = Character(
+        id=str(uuid.uuid4()), name="Alex", description="An explorer in the ruins"
+    )
+    luna = Character(id=str(uuid.uuid4()), name="Luna", description="A mysterious girl")
+    ruins = Scene(
+        id=str(uuid.uuid4()), name="Ancient Ruins", description="Crumbling stone halls"
+    )
     frame = StoryboardFrame(
         id=f"frame_{uuid.uuid4().hex[:8]}",
         scene_id=ruins.id,
@@ -81,6 +91,7 @@ def project(pipeline):
 # Step 1: Create Project
 # ---------------------------------------------------------------------------
 
+
 class TestCreateProject:
     def test_project_registered_and_persisted(self, pipeline, project):
         assert project.id in pipeline.scripts
@@ -96,6 +107,7 @@ class TestCreateProject:
 # ---------------------------------------------------------------------------
 # Step 2: Generate Assets
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateAssets:
     def test_all_assets_completed(self, pipeline, project):
@@ -117,20 +129,25 @@ class TestGenerateAssets:
 # Step 3: Generate Storyboard
 # ---------------------------------------------------------------------------
 
+
 class TestGenerateStoryboard:
     def test_storyboard_generator_receives_resolved_assets(self, pipeline, project):
-        pipeline.storyboard_generator.generate_storyboard.side_effect = \
+        pipeline.storyboard_generator.generate_storyboard.side_effect = (
             lambda script, **kwargs: script
+        )
         result = pipeline.generate_storyboard(project.id)
         assert result is project
         _, kwargs = pipeline.storyboard_generator.generate_storyboard.call_args
-        assert [c.id for c in kwargs["characters"]] == [c.id for c in project.characters]
+        assert [c.id for c in kwargs["characters"]] == [
+            c.id for c in project.characters
+        ]
         assert [s.id for s in kwargs["scenes"]] == [s.id for s in project.scenes]
 
 
 # ---------------------------------------------------------------------------
 # Step 4: Generate Video
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateVideo:
     def test_frames_receive_video_urls(self, pipeline, project):
@@ -149,6 +166,7 @@ class TestGenerateVideo:
 # Step 5: Generate Audio
 # ---------------------------------------------------------------------------
 
+
 class TestGenerateAudio:
     def test_dialogue_sfx_and_bgm_generated(self, pipeline, project):
         pipeline.generate_audio(project.id)
@@ -166,7 +184,8 @@ class TestGenerateAudio:
         frame = project.frames[0]
         speaker = next(c for c in project.characters if c.id == frame.character_ids[0])
         pipeline.audio_generator.generate_dialogue.assert_called_once_with(
-            frame, speaker,
+            frame,
+            speaker,
             speed=speaker.voice_speed,
             pitch=speaker.voice_pitch,
             volume=speaker.voice_volume,

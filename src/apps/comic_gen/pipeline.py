@@ -114,6 +114,8 @@ class ComicGenPipeline:
         # Project-independent global asset library (lowest resolver layer).
         self.library_store: GlobalAssetLibrary = self._load_library_data()
         self._repair_series_bindings()
+        self._dedupe_episode_shared_entities()
+        self._repair_empty_character_media()
 
         # Extraction preview cache: {project_id: (timestamp, Script)}
         self._extraction_cache: Dict[str, tuple] = {}
@@ -417,6 +419,9 @@ class ComicGenPipeline:
     def get_script(self, script_id: str) -> Optional[Script]:
         return self.scripts.get(script_id)
 
+    def get_asset_prompt_preview(self, asset_id: str) -> Optional[Dict[str, Any]]:
+        return getattr(self.asset_generator, "last_prompts", {}).get(asset_id)
+
     @property
     def task_manager(self) -> BackgroundTaskManager:
         manager = getattr(self, "_task_manager", None)
@@ -521,10 +526,14 @@ class ComicGenPipeline:
         is None the behavior is the original standalone-project path,
         bit-for-bit unchanged.
         """
+        series_obj = self.series_store.get(series_id) if series_id else None
+        world_context = self._world_bible_context(series_obj)
         if skip_analysis:
             script = self.script_processor.create_draft_script(title, text)
         else:
-            script = self.script_processor.parse_novel(title, text)
+            script = self.script_processor.parse_novel(
+                title, text, world_context=world_context
+            )
 
         script.workflow_mode = workflow_mode
         self.scripts[script.id] = script
@@ -544,6 +553,8 @@ class ComicGenPipeline:
                 [ep.episode_number for ep in existing if ep.episode_number] or [0]
             )
             self.add_episode_to_series(series_id, script.id, episode_number=max_ep + 1)
+        if self._merge_shared_entities(script):
+            self._save_data()
         return script
 
     def extract_preview(self, script_id: str, text: str) -> Script:
@@ -554,9 +565,18 @@ class ComicGenPipeline:
         custom_extraction = getattr(
             getattr(existing_script, "prompt_config", None), "entity_extraction", ""
         )
-        new_script = self.script_processor.parse_novel(
-            existing_script.title, text, custom_extraction
+        series_obj = (
+            self.series_store.get(existing_script.series_id)
+            if existing_script.series_id
+            else None
         )
+        new_script = self.script_processor.parse_novel(
+            existing_script.title,
+            text,
+            custom_extraction,
+            world_context=self._world_bible_context(series_obj),
+        )
+        self._merge_shared_entities(new_script)
         self._extraction_cache[script_id] = (time.time(), new_script)
         return new_script
 
@@ -580,8 +600,16 @@ class ComicGenPipeline:
             custom_extraction = getattr(
                 getattr(existing_script, "prompt_config", None), "entity_extraction", ""
             )
+            series_obj = (
+                self.series_store.get(existing_script.series_id)
+                if existing_script.series_id
+                else None
+            )
             new_script = self.script_processor.parse_novel(
-                existing_script.title, text, custom_extraction
+                existing_script.title,
+                text,
+                custom_extraction,
+                world_context=self._world_bible_context(series_obj),
             )
 
         # Preserve the original script ID and timestamps
@@ -614,6 +642,7 @@ class ComicGenPipeline:
         # carry over images/videos/lock/voice state. Only text-derived fields
         # (name/description/…) come from the fresh parse.
         id_map = self._merge_entity_assets(existing_script, new_script)
+        drop_map = self._merge_shared_entities(new_script)
 
         if preserve_frames and existing_script.frames:
             from copy import deepcopy
@@ -621,11 +650,16 @@ class ComicGenPipeline:
             remapped = []
             for frame in existing_script.frames:
                 cloned = deepcopy(frame)
-                cloned.scene_id = id_map.get(cloned.scene_id, cloned.scene_id)
+                sid = id_map.get(cloned.scene_id, cloned.scene_id)
+                cloned.scene_id = drop_map.get(sid, sid)
                 cloned.character_ids = [
-                    id_map.get(cid, cid) for cid in cloned.character_ids
+                    drop_map.get(id_map.get(cid, cid), id_map.get(cid, cid))
+                    for cid in cloned.character_ids
                 ]
-                cloned.prop_ids = [id_map.get(pid, pid) for pid in cloned.prop_ids]
+                cloned.prop_ids = [
+                    drop_map.get(id_map.get(pid, pid), id_map.get(pid, pid))
+                    for pid in cloned.prop_ids
+                ]
                 remapped.append(cloned)
             new_script.frames = remapped
             logger.info("Preserved %d storyboard frames across reparse", len(remapped))
@@ -637,6 +671,7 @@ class ComicGenPipeline:
 
     _CHAR_ASSET_FIELDS = (
         "reference_sheet",
+        "disposition",
         "full_body",
         "three_views",
         "head_shot",
@@ -752,6 +787,307 @@ class ComicGenPipeline:
                 new_entity.base_character_id = new_ids.get(old_base)
         return id_map
 
+    def _entity_has_media(self, entity, pool_attr: str) -> bool:
+        if pool_attr == "characters":
+            rs = getattr(entity, "reference_sheet", None)
+            if rs and getattr(rs, "image_variants", None):
+                return True
+            return bool(
+                getattr(entity, "image_url", None)
+                or getattr(entity, "full_body_image_url", None)
+            )
+        ia = getattr(entity, "image_asset", None)
+        if ia and getattr(ia, "variants", None):
+            return True
+        return bool(getattr(entity, "image_url", None))
+
+    def _merge_entity_pools(self, local: List[Any], *shared_pools) -> List[Any]:
+        """Layer asset pools by id AND name/alias, so a shared asset whose id
+        differs from an episode-local copy (same name) never renders twice."""
+        merged = list(local)
+        ids = {getattr(x, "id", None) for x in merged}
+        key_sets = [self._entity_keys(x) for x in merged]
+        for pool in shared_pools:
+            for entity in pool or []:
+                eid = getattr(entity, "id", None)
+                if eid in ids:
+                    continue
+                keys = self._entity_keys(entity)
+                if any(keys & existing for existing in key_sets):
+                    continue
+                merged.append(entity)
+                ids.add(eid)
+                key_sets.append(keys)
+        return merged
+
+    def _merge_shared_entities(self, script) -> Dict[str, str]:
+        """Reuse series/global assets during extraction instead of duplicating.
+
+        Newly parsed entities that match a shared asset by name/alias (and do
+        not already own media) are dropped from the episode, so the merged
+        read-time view (Episode → Series → Global) shows the shared asset only
+        once. Entities that already carry episode media are kept as overrides.
+        Returns {dropped_entity_id: shared_entity_id} for frame remapping.
+        """
+        series = self.series_store.get(script.series_id) if script.series_id else None
+        groups = (
+            (
+                "characters",
+                (getattr(series, "characters", []) if series else [])
+                + list(getattr(self.library_store, "characters", []) or []),
+            ),
+            (
+                "scenes",
+                (getattr(series, "scenes", []) if series else [])
+                + list(getattr(self.library_store, "scenes", []) or []),
+            ),
+            (
+                "props",
+                (getattr(series, "props", []) if series else [])
+                + list(getattr(self.library_store, "props", []) or []),
+            ),
+        )
+        drop_map: Dict[str, str] = {}
+        for pool_attr, shared_pool in groups:
+            new_pool = list(getattr(script, pool_attr, []) or [])
+            kept = []
+            for entity in new_pool:
+                keys = self._entity_keys(entity)
+                match = next(
+                    (
+                        s
+                        for s in shared_pool
+                        if keys & self._entity_keys(s)
+                        and self._entity_has_media(s, pool_attr)
+                    ),
+                    None,
+                )
+                if match is not None and not self._entity_has_media(entity, pool_attr):
+                    drop_map[entity.id] = match.id
+                    continue
+                kept.append(entity)
+            setattr(script, pool_attr, kept)
+        if drop_map:
+            logger.info(
+                "Reused %d series/global shared assets during extraction", len(drop_map)
+            )
+        return drop_map
+
+    def _world_bible_context(self, series) -> str:
+        """Compact, prompt-ready summary of the series worldview."""
+        if not series:
+            return ""
+        wb = getattr(series, "world_bible", None)
+        if not isinstance(wb, dict) or not wb:
+            return ""
+        labels = (
+            ("era", "时代背景"),
+            ("worldview", "世界观"),
+            ("cultivation_realm", "修炼境界"),
+            ("geography", "地理/场景"),
+            ("factions", "势力/宗门"),
+            ("architecture", "建筑"),
+            ("costume", "服饰"),
+            ("props_artifacts", "法宝/器物"),
+            ("customs", "风俗禁忌"),
+            ("visual_style", "视觉风格"),
+            ("positive_anchors", "必须出现的视觉锚点"),
+            ("forbidden", "禁止出现"),
+        )
+        parts = []
+        if wb.get("summary"):
+            parts.append(f"总览: {wb['summary']}")
+        for key, label in labels:
+            value = wb.get(key)
+            if isinstance(value, (list, tuple)):
+                value = "、".join(str(v) for v in value[:20] if v)
+            if value:
+                parts.append(f"{label}: {value}")
+        return "\n".join(parts)[:2500]
+
+    def _world_bible_asset_anchors(self, series) -> str:
+        """Short visual anchors appended to image prompts."""
+        if not series:
+            return ""
+        wb = getattr(series, "world_bible", None)
+        if not isinstance(wb, dict):
+            return ""
+        values = []
+        for key in ("positive_anchors", "costume", "architecture", "visual_style"):
+            value = wb.get(key)
+            if isinstance(value, (list, tuple)):
+                value = ", ".join(str(v) for v in value[:12] if v)
+            if value:
+                values.append(str(value))
+        return ", ".join(values)[:600]
+
+    def _previous_episode_context(self, script) -> str:
+        """Previous episode summary/frames for cross-chapter continuity."""
+        if not script or not getattr(script, "series_id", None):
+            return ""
+        series = self.series_store.get(script.series_id)
+        if not series:
+            return ""
+        episodes = [self.scripts.get(eid) for eid in (series.episode_ids or [])]
+        episodes = [e for e in episodes if e is not None]
+        episodes.sort(key=lambda e: (e.episode_number or 0, e.created_at or 0))
+        idx = next((i for i, e in enumerate(episodes) if e.id == script.id), -1)
+        if idx <= 0:
+            return ""
+        prev = episodes[idx - 1]
+        summary = getattr(prev, "last_episode_summary_cache", None)
+        if not summary:
+            lines = []
+            for frame in (prev.frames or [])[-8:]:
+                text = frame.action_description or frame.visual_description
+                if text:
+                    lines.append(text)
+            summary = "；".join(lines)
+        if not summary:
+            return f"上一集《{prev.title}》（无可用摘要）"
+        return f"上一集《{prev.title}》：{summary[:1500]}"
+
+    def _entity_media_urls(self, entity, pool_attr: str) -> set:
+        urls = set()
+        if pool_attr == "characters":
+            rs = getattr(entity, "reference_sheet", None)
+            for v in getattr(rs, "image_variants", None) or []:
+                if getattr(v, "url", None):
+                    urls.add(v.url)
+            for attr in ("image_url", "full_body_image_url"):
+                u = getattr(entity, attr, None)
+                if u:
+                    urls.add(u)
+        else:
+            ia = getattr(entity, "image_asset", None)
+            for v in getattr(ia, "variants", None) or []:
+                if getattr(v, "url", None):
+                    urls.add(v.url)
+            u = getattr(entity, "image_url", None)
+            if u:
+                urls.add(u)
+        return urls
+
+    def _dedupe_episode_shared_entities(self) -> None:
+        """One-time cleanup: drop episode-local copies of shared assets.
+
+        Older import/merge passes copied shared media into episode entities,
+        producing duplicate cards. If a local entity matches a shared asset by
+        name/alias and its media is empty or a subset of the shared media, the
+        local copy is removed so the shared asset is the single source.
+        """
+        changed = False
+        for script in list(self.scripts.values()):
+            series = (
+                self.series_store.get(script.series_id) if script.series_id else None
+            )
+            for pool_attr in ("characters", "scenes", "props"):
+                pool = list(getattr(script, pool_attr, []) or [])
+                shared_pool = (getattr(series, pool_attr, []) if series else []) + list(
+                    getattr(self.library_store, pool_attr, []) or []
+                )
+                if not shared_pool:
+                    continue
+                kept = []
+                for entity in pool:
+                    local_urls = self._entity_media_urls(entity, pool_attr)
+                    keys = self._entity_keys(entity)
+                    duplicate = False
+                    for shared in shared_pool:
+                        if not (keys & self._entity_keys(shared)):
+                            continue
+                        shared_urls = self._entity_media_urls(shared, pool_attr)
+                        if not shared_urls:
+                            continue
+                        if not local_urls or local_urls <= shared_urls:
+                            duplicate = True
+                            break
+                    if duplicate:
+                        changed = True
+                        logger.info(
+                            "Dropping duplicate local %s %s (shared asset reused)",
+                            pool_attr,
+                            getattr(entity, "name", ""),
+                        )
+                    else:
+                        kept.append(entity)
+                setattr(script, pool_attr, kept)
+        if changed:
+            self._save_data()
+
+    def _repair_empty_character_media(self) -> None:
+        """If the R2V reference sheet is empty, purge stale legacy media.
+
+        Older deletes removed reference_sheet variants but left image_url /
+        avatar_url / legacy full-body URLs behind, so the card kept showing an
+        image even though the workbench had 0 candidates. Clear those once so
+        the asset becomes genuinely empty and is picked up by batch generation.
+        """
+
+        def needs_clear(asset) -> bool:
+            rs = getattr(asset, "reference_sheet", None)
+            if rs is None or getattr(rs, "image_variants", None):
+                return False
+            for attr in (
+                "image_url",
+                "avatar_url",
+                "full_body_image_url",
+                "three_view_image_url",
+                "headshot_image_url",
+            ):
+                if getattr(asset, attr, None):
+                    return True
+            for attr in (
+                "full_body",
+                "three_views",
+                "head_shot",
+                "full_body_asset",
+                "three_view_asset",
+                "headshot_asset",
+            ):
+                unit = getattr(asset, attr, None)
+                if unit is None:
+                    continue
+                if getattr(unit, "image_variants", None) or getattr(
+                    unit, "variants", None
+                ):
+                    return True
+            return False
+
+        changed_data = changed_series = changed_library = False
+        for script in self.scripts.values():
+            if (getattr(script, "workflow_mode", "") or "") != "r2v":
+                continue
+            for character in script.characters:
+                if needs_clear(character):
+                    self._clear_character_media_fallbacks(character)
+                    changed_data = True
+        for series in self.series_store.values():
+            if (getattr(series, "workflow_mode", "") or "") != "r2v":
+                continue
+            for character in series.characters:
+                if needs_clear(character):
+                    self._clear_character_media_fallbacks(character)
+                    changed_series = True
+        for character in self.library_store.characters:
+            if needs_clear(character):
+                self._clear_character_media_fallbacks(character)
+                changed_library = True
+        if changed_data:
+            self._save_data()
+        if changed_series:
+            self._save_series_data()
+        if changed_library:
+            self._save_library_data()
+        if changed_data or changed_series or changed_library:
+            logger.info(
+                "Cleared stale legacy media on empty reference sheets "
+                "(episodes=%s, series=%s, library=%s)",
+                changed_data,
+                changed_series,
+                changed_library,
+            )
+
     def generate_assets(self, script_id: str) -> Script:
         """Step 2: Generate character and scene assets (Batch)."""
         script = self.scripts.get(script_id)
@@ -776,6 +1112,248 @@ class ComicGenPipeline:
 
         self._save_data()
         return script
+
+    def _asset_primary_image_url(self, asset, asset_type: str):
+        if asset_type == "character":
+            rs = getattr(asset, "reference_sheet", None)
+            variants = getattr(rs, "image_variants", None) if rs else None
+            if variants:
+                sel = next(
+                    (
+                        v
+                        for v in variants
+                        if v.id == getattr(rs, "selected_image_id", None)
+                    ),
+                    None,
+                )
+                return (sel or variants[0]).url
+            return getattr(asset, "image_url", None) or getattr(
+                asset, "full_body_image_url", None
+            )
+        ia = getattr(asset, "image_asset", None)
+        variants = getattr(ia, "variants", None) if ia else None
+        if variants:
+            sel = next(
+                (v for v in variants if v.id == getattr(ia, "selected_id", None)), None
+            )
+            return (sel or variants[0]).url
+        return getattr(asset, "image_url", None)
+
+    def _localize_style_reference(self, url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        if url.startswith("http://") or url.startswith("https://"):
+            try:
+                import requests
+
+                ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+                if ext not in ("png", "jpg", "jpeg", "webp"):
+                    ext = "png"
+                path = os.path.join(
+                    "output/uploads", f"style_ref_{uuid.uuid4().hex[:10]}.{ext}"
+                )
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                resp = requests.get(url, timeout=30)
+                if resp.status_code == 200 and len(resp.content) > 1024:
+                    with open(path, "wb") as f:
+                        f.write(resp.content)
+                    return path
+            except Exception as e:
+                logger.warning("Failed to download style reference %s: %s", url, e)
+            return None
+        if os.path.exists(url):
+            return url
+        candidate = os.path.join("output", url.lstrip("/"))
+        return candidate if os.path.exists(candidate) else None
+
+    def _entity_age_value(self, entity) -> Optional[int]:
+        import re as _re
+
+        match = _re.search(r"\d+", str(getattr(entity, "age", "") or ""))
+        if match:
+            return int(match.group())
+        blob = f"{getattr(entity, 'description', '') or ''} {getattr(entity, 'clothing', '') or ''}"
+        if any(
+            k in blob
+            for k in (
+                "老年",
+                "老妇",
+                "老头",
+                "老者",
+                "老翁",
+                "苍老",
+                "年长",
+                "年迈",
+                "花白",
+                "白发",
+                "银发",
+                "老丈",
+                "老汉",
+                "老先生",
+            )
+        ):
+            return 65
+        if any(
+            k in blob for k in ("中年", "妇人", "妇女", "农夫", "农妇", "大叔", "大婶")
+        ):
+            return 45
+        if any(k in blob for k in ("少女", "少年", "青年", "小伙", "姑娘")):
+            return 20
+        if any(k in blob for k in ("孩童", "小孩", "幼童")):
+            return 10
+        return None
+
+    def _entity_gender_value(self, entity) -> str:
+        value = (getattr(entity, "gender", "") or "").lower()
+        if value:
+            return value
+        name = getattr(entity, "name", "") or ""
+        blob = f"{name} {getattr(entity, 'description', '') or ''} {getattr(entity, 'clothing', '') or ''}"
+        if any(
+            k in name
+            for k in (
+                "母",
+                "妇",
+                "娘",
+                "姐",
+                "妹",
+                "婆",
+                "姑",
+                "女",
+                "妻",
+                "妃",
+                "后",
+                "公主",
+                "侍女",
+            )
+        ):
+            return "female"
+        if any(
+            k in name
+            for k in (
+                "父",
+                "公",
+                "爷",
+                "叔",
+                "伯",
+                "兄",
+                "弟",
+                "男",
+                "汉",
+                "夫",
+                "和尚",
+                "道士",
+            )
+        ):
+            return "male"
+        if any(
+            k in blob
+            for k in (
+                "妇人",
+                "妇女",
+                "女子",
+                "少女",
+                "女人",
+                "妻子",
+                "母亲",
+                "姑娘",
+                "她",
+            )
+        ):
+            return "female"
+        if any(k in blob for k in ("男子", "少年", "男人", "丈夫", "父亲", "他")):
+            return "male"
+        return ""
+
+    def _filter_style_ref_candidates(self, candidates, target):
+        """Avoid pulling a young protagonist's face into an elderly/龙套 asset.
+
+        Style references are meant to guide rendering, not identity. Gender
+        mismatch and large age gaps bias the output too strongly, so skip
+        those; prefer the same role tier and similar age.
+        """
+        t_role = (getattr(target, "role", "") or "").strip()
+        t_gender = self._entity_gender_value(target)
+        t_age = self._entity_age_value(target)
+        scored = []
+        for candidate in candidates:
+            c_gender = self._entity_gender_value(candidate)
+            if t_gender and c_gender:
+                t_male = "男" in t_gender or "male" in t_gender
+                c_male = "男" in c_gender or "male" in c_gender
+                t_female = "女" in t_gender or "female" in t_gender
+                c_female = "女" in c_gender or "female" in c_gender
+                if (t_male and c_female) or (t_female and c_male):
+                    continue
+            c_age = self._entity_age_value(candidate)
+            if t_age is not None and t_age >= 40 and c_age is not None and c_age < 30:
+                continue
+            score = 0
+            if t_role and (getattr(candidate, "role", "") or "").strip() == t_role:
+                score += 3
+            if t_gender and c_gender:
+                score += 1
+            if t_age is not None and c_age is not None and abs(t_age - c_age) <= 10:
+                score += 2
+            scored.append((score, candidate))
+        scored.sort(key=lambda item: -item[0])
+        if t_gender:
+            t_male = "男" in t_gender or "male" in t_gender
+            t_female = "女" in t_gender or "female" in t_gender
+            same_gender = []
+            for score, candidate in scored:
+                cg = self._entity_gender_value(candidate)
+                if not cg:
+                    continue
+                c_male = "男" in cg or "male" in cg
+                c_female = "女" in cg or "female" in cg
+                if (t_male and c_male) or (t_female and c_female):
+                    same_gender.append((score, candidate))
+            if not same_gender:
+                return []
+            scored = same_gender
+        if t_role in ("龙套", "群演", "路人"):
+            same_role = [
+                c for _, c in scored if (getattr(c, "role", "") or "").strip() == t_role
+            ]
+            return same_role
+        return [c for _, c in scored]
+
+    def collect_style_reference_paths(
+        self,
+        pools: List[List[Any]],
+        asset_type: str,
+        exclude_id: Optional[str] = None,
+        limit: int = 4,
+        target: Optional[Any] = None,
+    ) -> List[str]:
+        """Collect local reference images from existing same-type assets.
+
+        Used to keep newly generated characters/scenes/props visually close to
+        the already-imported/generated art (same series first, then global).
+        """
+        candidates: List[Any] = []
+        for pool in pools:
+            for asset in pool or []:
+                if getattr(asset, "id", None) == exclude_id:
+                    continue
+                candidates.append(asset)
+        if asset_type == "characters" or asset_type == "character":
+            if target is not None:
+                candidates = self._filter_style_ref_candidates(candidates, target)
+        urls: List[str] = []
+        for asset in candidates:
+            u = self._asset_primary_image_url(asset, asset_type)
+            if u and u not in urls:
+                urls.append(u)
+            if len(urls) >= limit:
+                break
+        paths: List[str] = []
+        for u in urls:
+            p = self._localize_style_reference(u)
+            if p:
+                paths.append(p)
+        return paths
 
     def generate_asset(
         self,
@@ -901,6 +1479,66 @@ class ComicGenPipeline:
         if asset_is_series_level:
             self._save_series_data()
 
+        series_obj = (
+            self.series_store.get(script.series_id) if script.series_id else None
+        )
+        if asset_type == "character":
+            style_pools = [
+                script.characters,
+                getattr(series_obj, "characters", []) or [],
+                list(self.library_store.characters),
+            ]
+        elif asset_type == "scene":
+            style_pools = [
+                script.scenes,
+                getattr(series_obj, "scenes", []) or [],
+                list(self.library_store.scenes),
+            ]
+        else:
+            style_pools = [
+                script.props,
+                getattr(series_obj, "props", []) or [],
+                list(self.library_store.props),
+            ]
+        style_refs = self.collect_style_reference_paths(
+            style_pools, asset_type, exclude_id=target_asset.id, target=target_asset
+        )
+        if style_refs:
+            style_hint = (
+                "consistent art style with the provided reference images, "
+                "matching rendering, color grading, lighting and detail level"
+            )
+            effective_positive_prompt = (
+                f"{effective_positive_prompt}, {style_hint}"
+                if effective_positive_prompt
+                else style_hint
+            )
+            logger.info(
+                "Using %d style reference image(s) for %s %s",
+                len(style_refs),
+                asset_type,
+                asset_id,
+            )
+
+        world_anchors = self._world_bible_asset_anchors(series_obj)
+        if world_anchors:
+            effective_positive_prompt = (
+                f"{effective_positive_prompt}, {world_anchors}"
+                if effective_positive_prompt
+                else world_anchors
+            )
+        world_bible = getattr(series_obj, "world_bible", None) if series_obj else None
+        if isinstance(world_bible, dict):
+            neg_anchors = world_bible.get("negative_anchors")
+            if isinstance(neg_anchors, (list, tuple)):
+                neg_anchors = ", ".join(str(v) for v in neg_anchors[:12] if v)
+            if neg_anchors:
+                effective_negative_prompt = (
+                    f"{effective_negative_prompt}, {neg_anchors}"
+                    if effective_negative_prompt
+                    else str(neg_anchors)
+                )
+
         try:
             # Generate with Art Direction style injected
             if asset_type == "character":
@@ -922,6 +1560,7 @@ class ComicGenPipeline:
                     model_name=t2i_model,
                     i2i_model_name=i2i_model,
                     size=effective_size,
+                    reference_image_paths=style_refs,
                 )
             elif asset_type == "scene":
                 self.asset_generator.generate_scene(
@@ -931,6 +1570,7 @@ class ComicGenPipeline:
                     batch_size=batch_size,
                     model_name=t2i_model,
                     size=effective_size,
+                    reference_image_paths=style_refs,
                 )
             elif asset_type == "prop":
                 self.asset_generator.generate_prop(
@@ -940,6 +1580,7 @@ class ComicGenPipeline:
                     batch_size=batch_size,
                     model_name=t2i_model,
                     size=effective_size,
+                    reference_image_paths=style_refs,
                 )
 
             target_asset.status = GenerationStatus.COMPLETED
@@ -1133,6 +1774,48 @@ class ComicGenPipeline:
         reference_image_url = params.get("reference_image_url")
 
         if asset_type == "character":
+            style_target = next(
+                (c for c in series.characters if c.id == asset_id), None
+            )
+            style_pools = [series.characters, list(self.library_store.characters)]
+        elif asset_type == "scene":
+            style_target = next((s for s in series.scenes if s.id == asset_id), None)
+            style_pools = [series.scenes, list(self.library_store.scenes)]
+        else:
+            style_target = next((p for p in series.props if p.id == asset_id), None)
+            style_pools = [series.props, list(self.library_store.props)]
+        style_refs = self.collect_style_reference_paths(
+            style_pools, asset_type, exclude_id=asset_id, target=style_target
+        )
+        if style_refs:
+            positive_prompt = (
+                f"{positive_prompt}, consistent art style with the provided reference images, "
+                "matching rendering, color grading, lighting and detail level"
+                if positive_prompt
+                else "consistent art style with the provided reference images, "
+                "matching rendering, color grading, lighting and detail level"
+            )
+
+        world_anchors = self._world_bible_asset_anchors(series)
+        if world_anchors:
+            positive_prompt = (
+                f"{positive_prompt}, {world_anchors}"
+                if positive_prompt
+                else world_anchors
+            )
+        world_bible = getattr(series, "world_bible", None)
+        if isinstance(world_bible, dict):
+            neg_anchors = world_bible.get("negative_anchors")
+            if isinstance(neg_anchors, (list, tuple)):
+                neg_anchors = ", ".join(str(v) for v in neg_anchors[:12] if v)
+            if neg_anchors:
+                negative_prompt = (
+                    f"{negative_prompt}, {neg_anchors}"
+                    if negative_prompt
+                    else str(neg_anchors)
+                )
+
+        if asset_type == "character":
             target = next((c for c in series.characters if c.id == asset_id), None)
             if not target:
                 raise ValueError(f"Character {asset_id} not found in series")
@@ -1145,6 +1828,7 @@ class ComicGenPipeline:
                 batch_size=batch_size,
                 model_name=t2i_model,
                 size=effective_size,
+                reference_image_paths=style_refs,
             )
         elif asset_type == "scene":
             target = next((s for s in series.scenes if s.id == asset_id), None)
@@ -1157,6 +1841,7 @@ class ComicGenPipeline:
                 batch_size=batch_size,
                 model_name=t2i_model,
                 size=effective_size,
+                reference_image_paths=style_refs,
             )
         elif asset_type == "prop":
             target = next((p for p in series.props if p.id == asset_id), None)
@@ -1169,6 +1854,7 @@ class ComicGenPipeline:
                 batch_size=batch_size,
                 model_name=t2i_model,
                 size=effective_size,
+                reference_image_paths=style_refs,
             )
         else:
             raise ValueError(f"Unknown asset type: {asset_type}")
@@ -1784,6 +2470,8 @@ class ComicGenPipeline:
         storyboard_extraction_prompt = self.get_effective_prompt(
             "storyboard_extraction", script, series
         )
+        world_context = self._world_bible_context(series)
+        previous_context = self._previous_episode_context(script)
 
         # Convert raw novel prose into screenplay format first (novel -> screenplay),
         # otherwise the storyboard extractor returns an empty frames array.
@@ -1807,6 +2495,8 @@ class ComicGenPipeline:
             analysis_text,
             entities_json,
             custom_extraction_prompt=storyboard_extraction_prompt,
+            world_context=world_context,
+            previous_context=previous_context,
         )
 
         if not raw_frames:
@@ -1827,6 +2517,8 @@ class ComicGenPipeline:
                     "\n".join(missing),
                     entities_json,
                     custom_extraction_prompt=storyboard_extraction_prompt,
+                    world_context=world_context,
+                    previous_context=previous_context,
                 )
                 if extra:
                     raw_frames.extend(extra)
@@ -4588,6 +5280,50 @@ class ComicGenPipeline:
                 return variant
         return None
 
+    def _delete_variant_in_asset_unit(self, unit: Any, variant_id: str) -> bool:
+        if not unit or not getattr(unit, "image_variants", None):
+            return False
+        before = len(unit.image_variants)
+        unit.image_variants = [v for v in unit.image_variants if v.id != variant_id]
+        if len(unit.image_variants) < before:
+            if getattr(unit, "selected_image_id", None) == variant_id:
+                unit.selected_image_id = (
+                    unit.image_variants[-1].id if unit.image_variants else None
+                )
+            return True
+        return False
+
+    def _clear_character_media_fallbacks(self, asset: Any) -> None:
+        """When the R2V reference sheet is emptied, legacy media fields must be
+        cleared too — otherwise the card keeps rendering an old full-body /
+        avatar fallback after the user deleted every candidate image."""
+        for attr in (
+            "image_url",
+            "avatar_url",
+            "full_body_image_url",
+            "three_view_image_url",
+            "headshot_image_url",
+        ):
+            if hasattr(asset, attr):
+                setattr(asset, attr, None)
+        for attr in (
+            "full_body",
+            "three_views",
+            "head_shot",
+            "full_body_asset",
+            "three_view_asset",
+            "headshot_asset",
+        ):
+            unit = getattr(asset, attr, None)
+            if unit is None:
+                continue
+            if hasattr(unit, "image_variants"):
+                unit.image_variants = []
+                unit.selected_image_id = None
+            elif hasattr(unit, "variants"):
+                unit.variants = []
+                unit.selected_id = None
+
     def _delete_variant_in_asset(self, image_asset: Any, variant_id: str) -> bool:
         """Helper to delete a variant in an ImageAsset. Returns True if found and deleted."""
         if not image_asset or not image_asset.variants:
@@ -4764,7 +5500,23 @@ class ComicGenPipeline:
                 (c for c in script.characters if c.id == asset_id), None
             )
             if target_asset:
-                if self._delete_variant_in_asset(
+                if self._delete_variant_in_asset_unit(
+                    target_asset.reference_sheet, variant_id
+                ):
+                    ref_sheet = target_asset.reference_sheet
+                    if not ref_sheet.image_variants:
+                        self._clear_character_media_fallbacks(target_asset)
+                    else:
+                        selected = next(
+                            (
+                                v
+                                for v in ref_sheet.image_variants
+                                if v.id == ref_sheet.selected_image_id
+                            ),
+                            ref_sheet.image_variants[0],
+                        )
+                        target_asset.image_url = selected.url if selected else None
+                elif self._delete_variant_in_asset(
                     target_asset.full_body_asset, variant_id
                 ):
                     # Sync legacy if needed
@@ -5118,21 +5870,25 @@ class ComicGenPipeline:
         through a request model). Recognized payload keys: name,
         description, image_url, persona (characters), voice_id
         (characters)."""
-        from .models import Character, Scene, Prop, AssetUnit, ImageVariant
+        from .models import Character, Scene, Prop, AssetUnit, ImageVariant, ImageAsset
 
         with self._save_lock:
             payload = dict(payload or {})
             name = payload.get("name") or "未命名"
             description = payload.get("description") or ""
             image_url = payload.get("image_url")
+            image_urls = [
+                u for u in (payload.get("image_urls") or []) if isinstance(u, str) and u
+            ]
+            if image_url and image_url not in image_urls:
+                image_urls.insert(0, image_url)
             if asset_type == "character":
                 ref_sheet = AssetUnit()
-                if image_url:
-                    variant = ImageVariant(
-                        id=f"img_{uuid.uuid4().hex[:12]}", url=image_url
-                    )
+                for u in image_urls:
+                    variant = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=u)
                     ref_sheet.image_variants.append(variant)
-                    ref_sheet.selected_image_id = variant.id
+                    if ref_sheet.selected_image_id is None:
+                        ref_sheet.selected_image_id = variant.id
                 asset = Character(
                     id=f"char_{uuid.uuid4().hex[:12]}",
                     name=name,
@@ -5141,6 +5897,7 @@ class ComicGenPipeline:
                     voice_id=payload.get("voice_id"),
                     reference_sheet=ref_sheet,
                     role=payload.get("role") or "配角",
+                    disposition=payload.get("disposition"),
                     aliases=payload.get("aliases") or [],
                     clothing=payload.get("clothing"),
                     age=payload.get("age"),
@@ -5149,18 +5906,32 @@ class ComicGenPipeline:
                     visual_weight=payload.get("visual_weight") or 3,
                 )
             elif asset_type == "scene":
+                img_asset = ImageAsset()
+                for u in image_urls:
+                    v = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=u)
+                    img_asset.variants.append(v)
+                    if img_asset.selected_id is None:
+                        img_asset.selected_id = v.id
                 asset = Scene(
                     id=f"scene_{uuid.uuid4().hex[:12]}",
                     name=name,
                     description=description,
-                    image_url=image_url,
+                    image_url=image_urls[0] if image_urls else None,
+                    image_asset=img_asset,
                 )
             elif asset_type == "prop":
+                img_asset = ImageAsset()
+                for u in image_urls:
+                    v = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=u)
+                    img_asset.variants.append(v)
+                    if img_asset.selected_id is None:
+                        img_asset.selected_id = v.id
                 asset = Prop(
                     id=f"prop_{uuid.uuid4().hex[:12]}",
                     name=name,
                     description=description,
-                    image_url=image_url,
+                    image_url=image_urls[0] if image_urls else None,
+                    image_asset=img_asset,
                 )
             else:
                 raise ValueError(f"Invalid asset type: {asset_type}")
@@ -5177,21 +5948,94 @@ class ComicGenPipeline:
         those)."""
         with self._save_lock:
             asset = self._find_library_asset(asset_type, asset_id)
-            image_url = (patch or {}).get("image_url")
-            if asset_type == "character" and image_url:
-                # Characters display from reference_sheet, so a bare image_url
-                # patch would not replace the visible art. Swap the canonical
-                # master variant too.
-                from .models import AssetUnit, ImageVariant
+            patch = dict(patch or {})
+            image_url = patch.get("image_url")
+            urls = [
+                u for u in (patch.get("image_urls") or []) if isinstance(u, str) and u
+            ]
+            if image_url and image_url not in urls:
+                urls.insert(0, image_url)
+            append = bool(patch.get("append_images"))
+            if urls:
+                from .models import AssetUnit, ImageAsset, ImageVariant
 
-                ref_sheet = getattr(asset, "reference_sheet", None) or AssetUnit()
-                variant = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=image_url)
-                ref_sheet.image_variants = [variant]
-                ref_sheet.selected_image_id = variant.id
-                asset.reference_sheet = ref_sheet
-            for key, value in (patch or {}).items():
-                if hasattr(asset, key) and key not in ("id", "status"):
+                if asset_type == "character":
+                    ref_sheet = getattr(asset, "reference_sheet", None) or AssetUnit()
+                    variants = list(ref_sheet.image_variants) if append else []
+                    existing_urls = {v.url for v in variants}
+                    for u in urls:
+                        if u in existing_urls:
+                            continue
+                        v = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=u)
+                        variants.append(v)
+                        existing_urls.add(u)
+                    ref_sheet.image_variants = variants
+                    if ref_sheet.selected_image_id is None and variants:
+                        ref_sheet.selected_image_id = variants[0].id
+                    asset.reference_sheet = ref_sheet
+                else:
+                    img_asset = getattr(asset, "image_asset", None) or ImageAsset()
+                    variants = list(img_asset.variants) if append else []
+                    existing_urls = {v.url for v in variants}
+                    for u in urls:
+                        if u in existing_urls:
+                            continue
+                        v = ImageVariant(id=f"img_{uuid.uuid4().hex[:12]}", url=u)
+                        variants.append(v)
+                        existing_urls.add(u)
+                    img_asset.variants = variants
+                    if img_asset.selected_id is None and variants:
+                        img_asset.selected_id = variants[0].id
+                    asset.image_asset = img_asset
+                asset.image_url = urls[0]
+            for key, value in patch.items():
+                if hasattr(asset, key) and key not in (
+                    "id",
+                    "status",
+                    "image_urls",
+                    "append_images",
+                ):
                     setattr(asset, key, value)
+            self._save_library_data_unlocked()
+            return asset
+
+    def delete_library_asset_variant(
+        self, asset_type: str, asset_id: str, variant_id: str
+    ):
+        """Remove a single generated variant from a global library asset."""
+        with self._save_lock:
+            asset = self._find_library_asset(asset_type, asset_id)
+            if asset_type == "character":
+                ref_sheet = getattr(asset, "reference_sheet", None)
+                variants = list(getattr(ref_sheet, "image_variants", []) or [])
+                kept = [v for v in variants if v.id != variant_id]
+                if len(kept) == len(variants):
+                    raise ValueError("Variant not found")
+                ref_sheet.image_variants = kept
+                if getattr(ref_sheet, "selected_image_id", None) == variant_id:
+                    ref_sheet.selected_image_id = kept[0].id if kept else None
+                asset.reference_sheet = ref_sheet
+                selected = next(
+                    (v for v in kept if v.id == ref_sheet.selected_image_id),
+                    kept[0] if kept else None,
+                )
+            else:
+                img_asset = getattr(asset, "image_asset", None)
+                variants = list(getattr(img_asset, "variants", []) or [])
+                kept = [v for v in variants if v.id != variant_id]
+                if len(kept) == len(variants):
+                    raise ValueError("Variant not found")
+                img_asset.variants = kept
+                if getattr(img_asset, "selected_id", None) == variant_id:
+                    img_asset.selected_id = kept[0].id if kept else None
+                asset.image_asset = img_asset
+                selected = next(
+                    (v for v in kept if v.id == img_asset.selected_id),
+                    kept[0] if kept else None,
+                )
+            asset.image_url = selected.url if selected else None
+            if asset_type == "character" and not kept:
+                self._clear_character_media_fallbacks(asset)
             self._save_library_data_unlocked()
             return asset
 
@@ -5450,7 +6294,26 @@ class ComicGenPipeline:
                     setattr(series, key, value)
             series.updated_at = time.time()
             self.series_store[series_id] = series
+            # Workflow switches must apply to existing episodes too — the
+            # episode view reads its own workflow_mode, not the series'. Keep
+            # the series as the source of truth and propagate on change.
+            propagate = {
+                k: updates[k]
+                for k in ("workflow_mode", "default_generation_mode")
+                if k in updates and hasattr(series, k)
+            }
+            if propagate:
+                for ep_id in series.episode_ids:
+                    episode = self.scripts.get(ep_id)
+                    if not episode:
+                        continue
+                    for key, value in propagate.items():
+                        if hasattr(episode, key):
+                            setattr(episode, key, value)
+                    episode.updated_at = time.time()
             self._save_series_data_unlocked()
+            if propagate:
+                self._save_data()
             return series
 
     def delete_series(self, series_id: str) -> None:
@@ -5870,48 +6733,28 @@ class ComicGenPipeline:
             # No parent series — episode-local assets sit on top of the
             # global library (lowest layer). With an empty library this
             # yields the episode's own assets (back-compat).
-            ep_char_ids = {c.id for c in episode.characters}
-            ep_scene_ids = {s.id for s in episode.scenes}
-            ep_prop_ids = {p.id for p in episode.props}
             return {
-                "characters": list(episode.characters)
-                + [c for c in self.library_store.characters if c.id not in ep_char_ids],
-                "scenes": list(episode.scenes)
-                + [s for s in self.library_store.scenes if s.id not in ep_scene_ids],
-                "props": list(episode.props)
-                + [p for p in self.library_store.props if p.id not in ep_prop_ids],
+                "characters": self._merge_entity_pools(
+                    episode.characters, self.library_store.characters
+                ),
+                "scenes": self._merge_entity_pools(
+                    episode.scenes, self.library_store.scenes
+                ),
+                "props": self._merge_entity_pools(
+                    episode.props, self.library_store.props
+                ),
             }
-        # Build lookup by ID for episode-local assets
-        ep_char_ids = {c.id for c in episode.characters}
-        ep_scene_ids = {s.id for s in episode.scenes}
-        ep_prop_ids = {p.id for p in episode.props}
-
-        merged_characters = list(episode.characters) + [
-            c for c in series.characters if c.id not in ep_char_ids
-        ]
-        merged_scenes = list(episode.scenes) + [
-            s for s in series.scenes if s.id not in ep_scene_ids
-        ]
-        merged_props = list(episode.props) + [
-            p for p in series.props if p.id not in ep_prop_ids
-        ]
-
-        # Fold the global library underneath as the lowest layer — only
-        # ids absent from both the Episode and Series layers. No-op when
-        # the library is empty (back-compat).
-        merged_char_ids = {c.id for c in merged_characters}
-        merged_scene_ids = {s.id for s in merged_scenes}
-        merged_prop_ids = {p.id for p in merged_props}
-
-        merged_characters += [
-            c for c in self.library_store.characters if c.id not in merged_char_ids
-        ]
-        merged_scenes += [
-            s for s in self.library_store.scenes if s.id not in merged_scene_ids
-        ]
-        merged_props += [
-            p for p in self.library_store.props if p.id not in merged_prop_ids
-        ]
+        # Merge by id AND name/alias so a shared asset never appears twice
+        # next to an episode-local copy with the same name but a different id.
+        merged_characters = self._merge_entity_pools(
+            episode.characters, series.characters, self.library_store.characters
+        )
+        merged_scenes = self._merge_entity_pools(
+            episode.scenes, series.scenes, self.library_store.scenes
+        )
+        merged_props = self._merge_entity_pools(
+            episode.props, series.props, self.library_store.props
+        )
 
         return {
             "characters": merged_characters,
@@ -6156,6 +6999,13 @@ class ComicGenPipeline:
                 unit.variants = remaining
                 if unit.selected_id == variant_id:
                     unit.selected_id = remaining[0].id if remaining else None
+            if (
+                asset_type == "character"
+                and kind == "asset_unit"
+                and unit is target.reference_sheet
+                and not unit.image_variants
+            ):
+                self._clear_character_media_fallbacks(target)
             series.updated_at = time.time()
             self._save_series_data_unlocked()
             return series

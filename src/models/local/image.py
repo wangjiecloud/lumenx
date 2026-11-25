@@ -10,6 +10,7 @@ Model routing:
 import logging
 import os
 import random
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +27,12 @@ from .runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Local diffusers pipelines are large; running two generations concurrently
+# loads/keeps multiple models resident and easily OOMs on 16-32GB machines.
+# Serialize all local image work process-wide (BackgroundTasks otherwise run
+# on a thread pool).
+_LOCAL_GENERATE_LOCK = threading.Lock()
 
 FLUX_RAM_THRESHOLD_GB = 40.0
 
@@ -217,6 +224,31 @@ class LocalImageModel:
         negative_prompt: str = "",
         **kwargs,
     ) -> Tuple[str, float]:
+        with _LOCAL_GENERATE_LOCK:
+            return self._generate_locked(
+                prompt,
+                output_path,
+                ref_image_path=ref_image_path,
+                ref_image_paths=ref_image_paths,
+                model_name=model_name,
+                size=size,
+                batch_size=batch_size,
+                negative_prompt=negative_prompt,
+                **kwargs,
+            )
+
+    def _generate_locked(
+        self,
+        prompt: str,
+        output_path: str,
+        ref_image_path: str = None,
+        ref_image_paths: List[str] = None,
+        model_name: str = None,
+        size: str = None,
+        batch_size: int = 1,
+        negative_prompt: str = "",
+        **kwargs,
+    ) -> Tuple[str, float]:
         start = time.time()
         width, height = parse_size(size, default=(1024, 576))
         seed = kwargs.get("seed")
@@ -229,6 +261,15 @@ class LocalImageModel:
             resolved = materialize_image(raw)
             if resolved:
                 refs.append(resolved)
+
+        # Cap reference images for local runs — extra refs mostly cost memory.
+        try:
+            max_refs = int(os.getenv("LOCAL_MAX_REF_IMAGES", "4"))
+        except ValueError:
+            max_refs = 4
+        if max_refs > 0 and len(refs) > max_refs:
+            logger.info("Limiting reference images %d -> %d", len(refs), max_refs)
+            refs = refs[:max_refs]
 
         mask_path = materialize_image(
             kwargs.get("mask_path") or kwargs.get("mask_image_path")

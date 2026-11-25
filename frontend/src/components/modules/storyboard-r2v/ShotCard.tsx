@@ -21,6 +21,8 @@ import {
     PinOff,
     Play,
     Star,
+    Plus,
+    Check,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import AssetChipBar from "./AssetChipBar";
@@ -124,6 +126,8 @@ interface ShotCardProps {
     onSetTabMode: (mode: "t2i_i2v" | "direct_r2v") => void;
     onOpenDrawer: () => void;
     onInsertAsset: (type: string, name: string) => void;
+    /** Persist the explicit cast selection (character ids) for this shot. */
+    onSetCharacters?: (names: string[]) => void;
     /** Duration editor config derived from model catalog */
     durationEditorConfig?: { min: number; max: number; step: number };
     /** Optional: Cancel CTA shown inside the pending-state affordance
@@ -175,6 +179,7 @@ export default function ShotCard({
     onSetTabMode,
     onOpenDrawer,
     onInsertAsset: _onInsertAsset,
+    onSetCharacters,
     durationEditorConfig,
     onCancelVideo,
     expanded,
@@ -196,6 +201,7 @@ export default function ShotCard({
     // discards the modal's draft without touching parent state.
     const [expandOpen, setExpandOpen] = useState(false);
     const [promptPreviewOpen, setPromptPreviewOpen] = useState(false);
+    const [castPickerOpen, setCastPickerOpen] = useState(false);
     // currentProjectId — needed by PolishPanel to look up the
     // project's PromptConfig override server-side.
     const currentProjectId = useProjectStore((state) => state.currentProject?.id);
@@ -280,6 +286,35 @@ export default function ShotCard({
         }
         return out;
     }, [shot.prompt, characters])();
+
+    const characterAvatarUrl = useCallback((c: any): string | undefined => (
+        c.avatar_url ||
+        c.headshot_image_url ||
+        c.image_url ||
+        c.full_body_image_url ||
+        selectedVariantUrl(c.reference_sheet) ||
+        (c.full_body_asset?.variants?.[0]?.url)
+    ), []);
+
+    const applyCastSelection = useCallback((names: string[]) => {
+        const cleaned = shot.prompt
+            .replace(/\[character\d*:[^\]]+\]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+        const tags = names
+            .map((name, i) => `[character${i + 1}:${name}]`)
+            .join(" ");
+        onUpdatePrompt(tags ? `${tags} ${cleaned}`.trim() : cleaned);
+        onSetCharacters?.(names);
+    }, [shot.prompt, onUpdatePrompt, onSetCharacters]);
+
+    const toggleCastCharacter = useCallback((name: string) => {
+        const current = castAvatars.map((c) => c.name);
+        const next = current.includes(name)
+            ? current.filter((n) => n !== name)
+            : [...current, name];
+        applyCastSelection(next);
+    }, [castAvatars, applyCastSelection]);
 
     const assembledPromptPreview = useMemo(() => buildAssembledPrompt(shot), [
         shot.prompt, shot.shotSize, shot.cameraAngle, shot.cameraMovementStructured, shot.transitionHint,
@@ -676,47 +711,109 @@ export default function ShotCard({
 
                     {/* Right: Prompt + Controls */}
                     <div className="flex-1 py-0.5 pl-5 pr-0 flex flex-col gap-3">
-                        {/* Cast avatar group */}
-                        {castAvatars.length > 0 ? (
-                            <div className="flex items-center gap-2">
-                                <span className="font-mono text-[0.625rem] uppercase tracking-[0.1em] text-text-muted">
-                                    {t("shotCast")}
-                                </span>
-                                <div className="flex items-center -space-x-2">
-                                    {castAvatars.slice(0, 3).map((c) => (
-                                        <button
-                                            key={c.id}
-                                            type="button"
-                                            onClick={() => {
-                                                document.dispatchEvent(
-                                                    new CustomEvent("lumenx:navigateStep", { detail: "cast" }),
-                                                );
-                                            }}
-                                            title={c.name}
-                                            className="grid h-[26px] w-[26px] place-items-center overflow-hidden rounded-full border-2 border-surface bg-elevated transition-all duration-fast ease-out-quart hover:z-10 hover:scale-110 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/55"
-                                        >
-                                            {c.avatarUrl ? (
-                                                <PreviewImage
-                                                    src={c.avatarUrl}
-                                                    alt={c.name}
-                                                    className="h-full w-full"
-                                                    noLightbox
-                                                />
-                                            ) : (
-                                                <span className="font-mono text-[0.5625rem] font-medium text-text-secondary">
-                                                    {c.name.slice(0, 1)}
-                                                </span>
-                                            )}
-                                        </button>
-                                    ))}
-                                    {castAvatars.length > 3 ? (
-                                        <span className="grid h-[26px] w-[26px] place-items-center rounded-full border-2 border-surface bg-elevated font-mono text-[0.5625rem] font-medium text-text-secondary">
-                                            +{castAvatars.length - 3}
-                                        </span>
-                                    ) : null}
-                                </div>
+                        {/* Cast avatar group + explicit character picker */}
+                        <div className="relative flex items-center gap-2 flex-wrap">
+                            <span className="font-mono text-[0.625rem] uppercase tracking-[0.1em] text-text-muted">
+                                {t("shotCast")}
+                            </span>
+                            <div className="flex items-center -space-x-2">
+                                {castAvatars.slice(0, 3).map((c) => (
+                                    <button
+                                        key={c.id}
+                                        type="button"
+                                        onClick={() => {
+                                            document.dispatchEvent(
+                                                new CustomEvent("lumenx:navigateStep", { detail: "cast" }),
+                                            );
+                                        }}
+                                        title={c.name}
+                                        className="grid h-[26px] w-[26px] place-items-center overflow-hidden rounded-full border-2 border-surface bg-elevated transition-all duration-fast ease-out-quart hover:z-10 hover:scale-110 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/55"
+                                    >
+                                        {c.avatarUrl ? (
+                                            <PreviewImage
+                                                src={c.avatarUrl}
+                                                alt={c.name}
+                                                className="h-full w-full"
+                                                noLightbox
+                                            />
+                                        ) : (
+                                            <span className="font-mono text-[0.5625rem] font-medium text-text-secondary">
+                                                {c.name.slice(0, 1)}
+                                            </span>
+                                        )}
+                                    </button>
+                                ))}
+                                {castAvatars.length > 3 ? (
+                                    <span className="grid h-[26px] w-[26px] place-items-center rounded-full border-2 border-surface bg-elevated font-mono text-[0.5625rem] font-medium text-text-secondary">
+                                        +{castAvatars.length - 3}
+                                    </span>
+                                ) : null}
                             </div>
-                        ) : null}
+                            <button
+                                type="button"
+                                onClick={() => setCastPickerOpen((v) => !v)}
+                                className="inline-flex items-center gap-1 rounded-full border border-dashed border-glass-border px-2 py-1 text-[0.625rem] text-text-secondary transition-colors hover:border-primary/40 hover:text-foreground"
+                                title={t("castPickerTitle")}
+                            >
+                                <Plus size={11} />
+                                {castAvatars.length === 0 ? t("castPickerTitle") : t("castEdit")}
+                            </button>
+
+                            {castPickerOpen ? (
+                                <>
+                                    <div
+                                        className="fixed inset-0 z-40"
+                                        onClick={() => setCastPickerOpen(false)}
+                                    />
+                                    <div className="absolute left-0 top-full z-50 mt-2 max-h-72 w-64 overflow-y-auto rounded-xl border border-glass-border bg-elevated p-1.5 shadow-xl">
+                                        {characters.length === 0 ? (
+                                            <div className="px-3 py-4 text-xs text-text-secondary">
+                                                {t("castPickerEmpty")}
+                                            </div>
+                                        ) : (
+                                            characters.map((c: any) => {
+                                                const checked = castAvatars.some((x) => x.id === c.id);
+                                                const url = characterAvatarUrl(c);
+                                                return (
+                                                    <button
+                                                        key={c.id}
+                                                        type="button"
+                                                        onClick={() => toggleCastCharacter(c.name)}
+                                                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-hover-bg"
+                                                    >
+                                                        <span className="grid h-7 w-7 shrink-0 place-items-center overflow-hidden rounded-full bg-surface">
+                                                            {url ? (
+                                                                <PreviewImage
+                                                                    src={url}
+                                                                    alt={c.name}
+                                                                    className="h-full w-full"
+                                                                    noLightbox
+                                                                />
+                                                            ) : (
+                                                                <span className="text-[0.625rem] text-text-secondary">
+                                                                    {c.name.slice(0, 1)}
+                                                                </span>
+                                                            )}
+                                                        </span>
+                                                        <span className="min-w-0 flex-1">
+                                                            <span className="block truncate text-xs text-foreground">
+                                                                {c.name}
+                                                            </span>
+                                                            <span className="block text-[0.5625rem] text-text-muted">
+                                                                {c.role || ""}
+                                                            </span>
+                                                        </span>
+                                                        {checked ? (
+                                                            <Check size={14} className="text-primary" />
+                                                        ) : null}
+                                                    </button>
+                                                );
+                                            })
+                                        )}
+                                    </div>
+                                </>
+                            ) : null}
+                        </div>
 
                         {/* Prompt Editor wrapper — with left accent line */}
                         <div className="relative">

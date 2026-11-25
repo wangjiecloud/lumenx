@@ -1078,10 +1078,12 @@ class CreateLibraryAssetRequest(BaseModel):
     description: Optional[str] = ""
     persona: Optional[str] = ""  # characters only — grouping label
     image_url: Optional[str] = None  # optional pre-uploaded master image
+    image_urls: Optional[List[str]] = None  # multiple images → one asset (variants)
     voice_id: Optional[str] = None  # characters only — TTS voice binding
     # Characters only — full Character-schema fields (previously omitted, so
     # imported casts lost their story role/aliases).
     role: Optional[str] = None  # 主角 | 重要配角 | 配角 | 龙套
+    disposition: Optional[str] = None
     aliases: Optional[List[str]] = None
     clothing: Optional[str] = None
     age: Optional[str] = None
@@ -1097,11 +1099,14 @@ class UpdateLibraryAssetRequest(BaseModel):
     description: Optional[str] = None
     persona: Optional[str] = None
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
+    append_images: Optional[bool] = None
     voice_id: Optional[str] = None
     starred: Optional[bool] = None
     locked: Optional[bool] = None
     visual_weight: Optional[int] = None
     role: Optional[str] = None
+    disposition: Optional[str] = None
     aliases: Optional[List[str]] = None
     clothing: Optional[str] = None
     age: Optional[str] = None
@@ -1215,6 +1220,20 @@ def delete_library_asset(asset_type: str, asset_id: str, force: bool = False):
                 "references": e.references,
                 "hint": "Pass ?force=true to delete anyway.",
             },
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/library/assets/{asset_type}/{asset_id}/variants/{variant_id}")
+def delete_library_asset_variant(asset_type: str, asset_id: str, variant_id: str):
+    try:
+        return signed_response(
+            pipeline.delete_library_asset_variant(
+                asset_type, asset_id, variant_id
+            ).model_dump()
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1585,7 +1604,33 @@ def get_project(script_id: str):
         for item in asset_list:
             item["source"] = "episode"
 
-    # Merge series-shared assets on top (any id not already present
+    def _asset_keys(item):
+        if isinstance(item, dict):
+            name = item.get("name") or ""
+            aliases = item.get("aliases") or []
+        else:
+            name = getattr(item, "name", "") or ""
+            aliases = getattr(item, "aliases", []) or []
+        keys = {str(name).strip().casefold()}
+        keys.update(str(a).strip().casefold() for a in aliases)
+        return {k for k in keys if k}
+
+    def _append_layer(target, shared_items, source):
+        seen_ids = {x.get("id") for x in target}
+        seen_keys = [_asset_keys(x) for x in target]
+        for item in shared_items:
+            if item.id in seen_ids:
+                continue
+            keys = _asset_keys(item)
+            if any(keys & existing for existing in seen_keys):
+                continue
+            d = item.model_dump()
+            d["source"] = source
+            target.append(d)
+            seen_ids.add(item.id)
+            seen_keys.append(keys)
+
+    # Merge series-shared assets on top (any id/name not already present
     # locally — episode-local overrides series). Without this step
     # the user "loses" characters when switching between episodes of
     # the same series, because the series shared pool isn't
@@ -1593,50 +1638,20 @@ def get_project(script_id: str):
     if script.series_id:
         series = pipeline.get_series(script.series_id)
         if series:
-            ep_char_ids = {c.id for c in script.characters}
-            ep_scene_ids = {s.id for s in script.scenes}
-            ep_prop_ids = {p.id for p in script.props}
-            for ch in series.characters:
-                if ch.id not in ep_char_ids:
-                    d = ch.model_dump()
-                    d["source"] = "series"
-                    payload["characters"].append(d)
-            for sc in series.scenes:
-                if sc.id not in ep_scene_ids:
-                    d = sc.model_dump()
-                    d["source"] = "series"
-                    payload["scenes"].append(d)
-            for pr in series.props:
-                if pr.id not in ep_prop_ids:
-                    d = pr.model_dump()
-                    d["source"] = "series"
-                    payload["props"].append(d)
+            _append_layer(payload["characters"], series.characters, "series")
+            _append_layer(payload["scenes"], series.scenes, "series")
+            _append_layer(payload["props"], series.props, "series")
 
     # Merge the project-independent global asset library underneath as
-    # the lowest layer. Any id not already present from the episode or
-    # series layers is appended with source="global" (read-time only —
+    # the lowest layer. Any id/name not already present from the episode
+    # or series layers is appended with source="global" (read-time only —
     # never written back to projects.json). When the library is empty
     # this is a no-op and the response is byte-identical to before.
     lib = pipeline.library_store
     if lib.characters or lib.scenes or lib.props:
-        seen_char_ids = {c["id"] for c in payload["characters"]}
-        seen_scene_ids = {s["id"] for s in payload["scenes"]}
-        seen_prop_ids = {p["id"] for p in payload["props"]}
-        for ch in lib.characters:
-            if ch.id not in seen_char_ids:
-                d = ch.model_dump()
-                d["source"] = "global"
-                payload["characters"].append(d)
-        for sc in lib.scenes:
-            if sc.id not in seen_scene_ids:
-                d = sc.model_dump()
-                d["source"] = "global"
-                payload["scenes"].append(d)
-        for pr in lib.props:
-            if pr.id not in seen_prop_ids:
-                d = pr.model_dump()
-                d["source"] = "global"
-                payload["props"].append(d)
+        _append_layer(payload["characters"], lib.characters, "global")
+        _append_layer(payload["scenes"], lib.scenes, "global")
+        _append_layer(payload["props"], lib.props, "global")
     return signed_response(payload)
 
 
@@ -2814,6 +2829,13 @@ def generate_single_asset(
 def list_tasks(active_only: bool = False):
     """List in-process background tasks for the Task Manager view."""
     return {"tasks": pipeline.task_manager.list_tasks(active_only=active_only)}
+
+
+@app.get("/assets/{asset_id}/prompt_preview")
+def get_asset_prompt_preview(asset_id: str):
+    """Return the last effective prompt actually sent to the image model for
+    this asset (None before its first generation)."""
+    return {"prompt": pipeline.get_asset_prompt_preview(asset_id)}
 
 
 @app.post("/tasks/{task_id}/pause")

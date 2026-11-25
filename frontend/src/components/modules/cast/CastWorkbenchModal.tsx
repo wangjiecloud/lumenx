@@ -20,7 +20,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Sparkles, Loader2, Check, RefreshCw, Wand2, Palette, Star } from "lucide-react";
+import { X, Sparkles, Loader2, Check, RefreshCw, Wand2, Palette, Star, Trash2 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { api } from "@/lib/api";
 import { useProjectStore, IMAGE_MODELS } from "@/store/projectStore";
@@ -109,8 +109,8 @@ const CHARACTER_TEMPLATES: Record<CharacterTemplate, {
     simple: {
         labelKey: "tplSimpleLabel",
         descKey: "tplSimpleDesc",
-        compositionEn: "Composition: character reference sheet, single unified image, seamless layout without borders or frames, neutral gray background. Left half: large head close-up portrait (shoulders up, sharp facial details, front-facing, detailed skin texture). Right half: three equally-sized full-body standing poses arranged side by side (front view, side view, back view), head-to-toe fully visible, relaxed neutral pose. Consistent soft studio lighting across all views, no harsh shadows, even illumination.",
-        negativeAppend: "text, labels, watermark, UI overlay, panel borders, frames, multiple separate images",
+        compositionEn: "Composition: single character reference image, one person only, full body from head to toe, standing straight and centered, entire head and feet fully inside the frame with generous margins, no cropping, neutral gray background, relaxed neutral pose, soft studio lighting, even illumination, front-facing.",
+        negativeAppend: "cropped, cut off, out of frame, partial body, half body, missing head, missing feet, text, labels, watermark, UI overlay, panel borders, frames, multiple separate images, multiple people",
         exampleImage: "/assets/templates/simple-triview.png",
     },
     detailed: {
@@ -208,7 +208,9 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
     const selectedId = useMemo(() => readSelectedId(entity, kind ?? "character"), [entity, kind]);
 
     const [prompt, setPrompt] = useState("");
-    const [batchSize, setBatchSize] = useState(2);
+    const [batchSize, setBatchSize] = useState(1);
+    const [imageBackend, setImageBackend] = useState<"local" | "dashscope" | null>(null);
+    const [effectivePrompt, setEffectivePrompt] = useState<any>(null);
     const [aspectRatioOverride, setAspectRatioOverride] = useState<string | null>(null);
     const [modelOverride, setModelOverride] = useState<string | null>(null);
     const [positiveExpanded, setPositiveExpanded] = useState(false);
@@ -245,6 +247,35 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
     useEffect(() => {
         api.getStylePresets().then((res: any) => setPresets(res?.presets || res || [])).catch(() => {});
     }, []);
+
+    // Active image backend — when local, the cloud model picker is misleading
+    // (the backend ignores it). Hide it and show the local model notice.
+    useEffect(() => {
+        if (!isOpen) return;
+        let cancelled = false;
+        api.getEnvConfig()
+            .then((cfg: any) => {
+                if (!cancelled) {
+                    setImageBackend(cfg?.IMAGE_BACKEND === "local" ? "local" : "dashscope");
+                }
+            })
+            .catch(() => {
+                if (!cancelled) setImageBackend("dashscope");
+            });
+        return () => { cancelled = true; };
+    }, [isOpen]);
+
+    // Fetch the actual last prompt sent to the model (may be the local compact
+    // prompt, which differs from the template textarea).
+    useEffect(() => {
+        if (!isOpen || !entity?.id) return;
+        let cancelled = false;
+        setEffectivePrompt(null);
+        api.getAssetPromptPreview(entity.id)
+            .then((data: any) => { if (!cancelled && data) setEffectivePrompt(data); })
+            .catch(() => {});
+        return () => { cancelled = true; };
+    }, [isOpen, entity?.id]);
 
     if (!isOpen || !kind || !entity || !currentProject) return null;
 
@@ -362,6 +393,18 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                     updateProject: useProjectStore.getState().updateProject,
                     removeGeneratingTask: useProjectStore.getState().removeGeneratingTask,
                 }), progressId);
+                let previewTries = 0;
+                const previewTimer = setInterval(async () => {
+                    previewTries += 1;
+                    try {
+                        const data = await api.getAssetPromptPreview(capturedEntityId);
+                        if (data) {
+                            setEffectivePrompt(data);
+                            clearInterval(previewTimer);
+                        }
+                    } catch { /* ignore */ }
+                    if (previewTries >= 30) clearInterval(previewTimer);
+                }, 2000);
             } else if (resp) {
                 toast.dismiss(progressId);
                 updateProject(currentProject.id, resp);
@@ -411,6 +454,33 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
             );
             updateProject(currentProject.id, updated);
         } catch { /* silent — non-critical */ }
+    };
+
+    const handleDeleteVariant = async (variantId: string) => {
+        if (!confirm(t("confirmDeleteVariant"))) return;
+        try {
+            const source = (entity as any).source;
+            if (source === "series" && currentProject.series_id) {
+                await api.seriesDeleteAssetVariant(
+                    currentProject.series_id, entity.id, kind, variantId,
+                );
+                const fresh = await api.getProject(currentProject.id);
+                updateProject(currentProject.id, fresh);
+            } else if (source === "global") {
+                await api.deleteLibraryAssetVariant(kind, entity.id, variantId);
+                const fresh = await api.getProject(currentProject.id);
+                updateProject(currentProject.id, fresh);
+            } else {
+                const updated = await api.deleteAssetVariant(
+                    currentProject.id, entity.id, kind, variantId,
+                );
+                updateProject(currentProject.id, updated);
+            }
+            toast.success(t("toastDeleted"));
+        } catch (err: any) {
+            const detail = err?.response?.data?.detail || err?.message || "delete failed";
+            toast.error(t("toastDeleteErr"), { body: String(detail) });
+        }
     };
 
     const filteredVariants = galleryFilter === "favorited"
@@ -700,8 +770,10 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                                 ))}
                             </div>
 
-                            {/* Final prompt preview — collapsible, scrollable */}
-                            {applyStyle && stylePositive && (
+                            {/* Final prompt preview — shows the ACTUAL prompt sent
+                                to the model when available (local mode compacts
+                                it), otherwise the composed template. */}
+                            {(effectivePrompt || (applyStyle && stylePositive)) && (
                                 <div className="mt-3 rounded-md bg-black/20 border border-glass-border">
                                     <button
                                         type="button"
@@ -713,11 +785,28 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                                     </button>
                                     {finalPreviewExpanded && (
                                         <div className="px-3.5 pb-3 max-h-[200px] overflow-y-auto overscroll-contain">
-                                            <p className="text-[0.75rem] leading-relaxed">
-                                                <span className="text-foreground">{prompt.trim()}</span>
-                                                {prompt.trim() && <span className="text-text-muted">{", "}</span>}
-                                                <span className="text-primary/60">{stylePositive}</span>
-                                            </p>
+                                            {effectivePrompt ? (
+                                                <div className="space-y-2 text-[0.75rem] leading-relaxed">
+                                                    {effectivePrompt.local && (
+                                                        <p className="text-[0.625rem] text-amber-300/80">{t("localPromptNote")}</p>
+                                                    )}
+                                                    <p>
+                                                        <span className="text-primary/70">Positive: </span>
+                                                        <span className="text-foreground">{effectivePrompt.positive}</span>
+                                                    </p>
+                                                    <p>
+                                                        <span className="text-red-400/80">Negative: </span>
+                                                        <span className="text-text-secondary">{effectivePrompt.negative}</span>
+                                                    </p>
+                                                    <p className="text-[0.625rem] text-text-muted">size: {effectivePrompt.size}</p>
+                                                </div>
+                                            ) : (
+                                                <p className="text-[0.75rem] leading-relaxed">
+                                                    <span className="text-foreground">{prompt.trim()}</span>
+                                                    {prompt.trim() && <span className="text-text-muted">{", "}</span>}
+                                                    <span className="text-primary/60">{stylePositive}</span>
+                                                </p>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -780,27 +869,40 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                                     <label className="block font-mono text-[0.625rem] uppercase tracking-[0.16em] text-text-muted mb-2">
                                         {t("modelLabel")}
                                     </label>
-                                    <GroupedModelGrid
-                                        models={IMAGE_MODELS}
-                                        selectedId={modelOverride || currentProject.model_settings?.t2i_model || "wan2.1-t2i"}
-                                        onSelect={(id) => setModelOverride(id === (currentProject.model_settings?.t2i_model || "wan2.1-t2i") ? null : id)}
-                                    />
+                                    {imageBackend === "local" ? (
+                                        <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-3">
+                                            <div className="text-sm font-semibold text-foreground">
+                                                {t("localModelTitle")}
+                                            </div>
+                                            <p className="mt-1 text-[0.6875rem] leading-relaxed text-text-secondary">
+                                                {t("localModelDesc")}
+                                            </p>
+                                        </div>
+                                    ) : (
+                                        <GroupedModelGrid
+                                            models={IMAGE_MODELS}
+                                            selectedId={modelOverride || currentProject.model_settings?.t2i_model || "wan2.1-t2i"}
+                                            onSelect={(id) => setModelOverride(id === (currentProject.model_settings?.t2i_model || "wan2.1-t2i") ? null : id)}
+                                        />
+                                    )}
                                 </div>
                             </div>
 
-                            {/* Generate CTA */}
-                            <button
-                                onClick={handleGenerate}
-                                disabled={generating || !prompt.trim()}
-                                className="mt-5 self-center inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-md bg-primary text-white border border-[rgba(100,108,255,0.65)] shadow-[inset_0_1.5px_0_rgba(255,255,255,0.14)] hover:bg-primary-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-[0.875rem] font-semibold"
-                            >
-                                {generating ? <Loader2 size={15} className="animate-spin" /> : <Wand2 size={15} />}
-                                {generating
-                                    ? t("generating")
-                                    : variants.length === 0
-                                        ? t("generateFirst")
-                                        : t("generateMore", { count: batchSize })}
-                            </button>
+                            {/* Generate CTA — sticky so it stays visible while editing */}
+                            <div className="sticky bottom-0 z-10 -mx-5 -mb-5 mt-5 flex justify-center border-t border-glass-border bg-surface/95 px-5 py-4 backdrop-blur">
+                                <button
+                                    onClick={handleGenerate}
+                                    disabled={generating || !prompt.trim()}
+                                    className="inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-md bg-primary text-white border border-[rgba(100,108,255,0.65)] shadow-[inset_0_1.5px_0_rgba(255,255,255,0.14)] hover:bg-primary-hover disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-[0.875rem] font-semibold"
+                                >
+                                    {generating ? <Loader2 size={15} className="animate-spin" /> : <Wand2 size={15} />}
+                                    {generating
+                                        ? t("generating")
+                                        : variants.length === 0
+                                            ? t("generateFirst")
+                                            : t("generateMore", { count: batchSize })}
+                                </button>
+                            </div>
                         </div>
 
                         {/* RIGHT — variants gallery */}
@@ -882,6 +984,14 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                                                     }`}
                                                 >
                                                     <Star size={12} className={v.is_favorited ? "fill-amber-300" : ""} />
+                                                </button>
+                                                {/* Delete variant */}
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); handleDeleteVariant(v.id); }}
+                                                    title={t("deleteVariant")}
+                                                    className={`absolute top-1.5 ${isSelected ? "right-9" : "right-1.5"} p-1 rounded-full bg-black/50 text-red-300 opacity-0 group-hover:opacity-100 transition-all hover:bg-red-500/30`}
+                                                >
+                                                    <Trash2 size={12} />
                                                 </button>
                                                 {/* Selected badge */}
                                                 {isSelected && (
