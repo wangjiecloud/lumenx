@@ -218,12 +218,57 @@ class AssetGenerator:
             )
         ):
             return (
-                "wearing simple coarse linen peasant clothes, plain rural Chinese hanfu, "
-                "cloth belt, humble village woman outfit, no jewelry",
-                "ball gown, evening dress, wedding dress, noble robe, luxurious costume, "
-                "ornate jewelry, earrings, tiara, crown, western dress, Victorian dress",
+                "wearing ancient Chinese faded coarse linen short jacket and loose "
+                "trousers, cloth shoes, traditional peasant clothing, no modern suit",
+                "modern suit, tunic suit, blazer, shirt, jeans, uniform, "
+                "military uniform, modern shoes, sneakers, ball gown, evening dress, "
+                "noble robe, luxurious costume, ornate jewelry",
+            )
+        if any(k in blob for k in ("读书人", "书生", "儒生", "文人", "教书先生")):
+            return (
+                "simple old-fashioned Chinese scholar robe, long gown, cloth scarf, "
+                "modest literati clothing, no armor",
+                "armor, luxury robe, ornate jewelry, modern clothing",
             )
         return ("", "")
+
+    def _body_anchors(self, character) -> str:
+        blob = " ".join(
+            str(v)
+            for v in (
+                getattr(character, "description", "") or "",
+                getattr(character, "clothing", "") or "",
+                getattr(character, "prompt_en", "") or "",
+            )
+        )
+        if any(
+            k in blob
+            for k in (
+                "圆脸",
+                "胖胖",
+                "微胖",
+                "丰满",
+                "富态",
+                "发福",
+                "敦实",
+                "小肚腩",
+                "肥胖",
+                "肉脸",
+                "圆润",
+                "chubby",
+                "round face",
+                "plump",
+                "stocky",
+            )
+        ):
+            return "chubby round face, plump body, slightly heavy stocky build"
+        if any(k in blob for k in ("清瘦", "消瘦", "瘦削", "骨瘦", "thin", "lean")):
+            return "thin lean face, slim body"
+        if any(k in blob for k in ("魁梧", "高大", "强壮", "健壮", "muscular", "tall")):
+            return "tall strong muscular build"
+        if any(k in blob for k in ("矮小", "矮胖", "short stature")):
+            return "short stature"
+        return ""
 
     def _get_model_for(self, model_name: str) -> "ImageGenModel":
         """Route to the correct image adapter based on model name."""
@@ -325,6 +370,28 @@ class AssetGenerator:
 
         _age_match = _re.search(r"\d+", str(getattr(character, "age", "") or ""))
         _age = int(_age_match.group()) if _age_match else None
+        if _age is None:
+            _age_text = (
+                str(getattr(character, "age", "") or "")
+                + " "
+                + (getattr(character, "description", "") or "")
+            )
+            for _cn, _val in (
+                ("二十", 25),
+                ("三十", 35),
+                ("四十", 45),
+                ("五十", 55),
+                ("六十", 65),
+                ("七十", 75),
+                ("八十", 80),
+            ):
+                if (
+                    f"{_cn}多岁" in _age_text
+                    or f"{_cn}多" in _age_text
+                    or f"{_cn}岁" in _age_text
+                ):
+                    _age = _val
+                    break
         _young = _age is not None and _age <= 16
         if "男" in gender or "male" in gender:
             looks = "handsome youthful boy" if _young else "handsome masculine man"
@@ -424,6 +491,23 @@ class AssetGenerator:
             disposition
         )
         clothing_positive, clothing_negative = self._clothing_anchors(character)
+        body_positive = self._body_anchors(character)
+        _feat_blob = f"{getattr(character, 'description', '') or ''} {getattr(character, 'clothing', '') or ''} {getattr(character, 'prompt_en', '') or ''}"
+        hair_positive = ""
+        if any(k in _feat_blob for k in ("短发", "寸头", "利落短发", "short hair")):
+            hair_positive = "short hair"
+        elif any(k in _feat_blob for k in ("长发", "披肩发", "long hair")):
+            hair_positive = "long hair"
+        elif any(k in _feat_blob for k in ("束发", "发髻", "马尾", "发冠")):
+            hair_positive = "hair tied up"
+        facial_positive = ""
+        if any(
+            k in _feat_blob
+            for k in ("硬朗", "刚毅", "棱角分明", "冷峻", "严肃", "锐利")
+        ):
+            facial_positive = (
+                "hard angular facial features, sharp jawline, stern masculine face"
+            )
         _blob_all = f"{getattr(character, 'description', '') or ''} {getattr(character, 'clothing', '') or ''}"
         if any(
             k in _blob_all
@@ -437,6 +521,14 @@ class AssetGenerator:
             ethnicity_negative = (
                 "caucasian, western, european, blonde hair, blue eyes, western costume"
             )
+
+        facial_hair_positive = ""
+        if "络腮胡" in _blob_all:
+            facial_hair_positive = "full thick beard and mustache"
+        elif any(k in _blob_all for k in ("八字胡", "小胡子", "髭须")):
+            facial_hair_positive = "small mustache, thin moustache"
+        elif any(k in _blob_all for k in ("胡须", "胡子", "短须")):
+            facial_hair_positive = "short beard and mustache"
 
         role_negative = ""
         if role in ("龙套", "群演", "路人"):
@@ -534,6 +626,17 @@ class AssetGenerator:
                     effective_prompt = f"{ethnicity_positive}, {effective_prompt}"
                 if clothing_positive and clothing_positive not in effective_prompt:
                     effective_prompt = f"{clothing_positive}, {effective_prompt}"
+                if (
+                    facial_hair_positive
+                    and facial_hair_positive not in effective_prompt
+                ):
+                    effective_prompt = f"{facial_hair_positive}, {effective_prompt}"
+                if body_positive and body_positive not in effective_prompt:
+                    effective_prompt = f"{body_positive}, {effective_prompt}"
+                if hair_positive and hair_positive not in effective_prompt:
+                    effective_prompt = f"{hair_positive}, {effective_prompt}"
+                if facial_positive and facial_positive not in effective_prompt:
+                    effective_prompt = f"{facial_positive}, {effective_prompt}"
 
                 # Framing must come first — local SDXL truncates long prompts,
                 # and composition instructions at the end get dropped, which is
@@ -591,29 +694,38 @@ class AssetGenerator:
                         "upright": "honest upright face, calm gaze",
                         "neutral": "natural friendly face",
                     }.get(disposition, "natural friendly face")
-                    clothing_short = (
-                        clothing_positive.split(",")[0] if clothing_positive else ""
-                    )
+                    clothing_short = clothing_positive or ""
                     compact_parts = [
                         "Chinese 3D donghua cinematic render",
-                        "single character, full body from head to toe, centered, no crop",
+                        "one single figure, front view only, full body from head to toe, centered, no crop",
                         f"East Asian Chinese {age_gender_word}",
                         age_short,
-                        disp_short,
+                        body_positive,
                         clothing_short,
+                        hair_positive,
+                        facial_positive,
+                        disp_short,
+                        facial_hair_positive,
                     ]
                     effective_prompt = ", ".join(p for p in compact_parts if p)
                     if getattr(character, "prompt_en", None):
                         effective_prompt += f", {character.prompt_en[:100]}"
+                    if positive_prompt:
+                        effective_prompt += f", {positive_prompt[:100]}"
                     compact_negative = ", ".join(
                         p
                         for p in (
                             "multiple panels, collage, split screen, character sheet, "
-                            "grid of faces, text, watermark, signature, border",
+                            "grid of faces, two figures, front and back view, "
+                            "multiple views, turnaround, duplicate person, "
+                            "modern suit, tunic suit, uniform, jeans, "
+                            "text, watermark, signature, border",
                             crop_negative,
-                            "male, man, beard, mustache, caucasian, western, blonde, "
-                            "blue eyes, young, baby face, ball gown, jewelry, 2D, "
-                            "illustration, anime, cel shading",
+                            gender_negative,
+                            ethnicity_negative,
+                            age_negative,
+                            clothing_negative,
+                            "2D, illustration, anime, cel shading, flat color",
                             "low quality, blurry, deformed, extra limbs, bad anatomy",
                         )
                         if p
@@ -1337,7 +1449,7 @@ class AssetGenerator:
             f"ancient Chinese architecture, timber-frame, tiled roof, paper windows, "
             f"no tatami, no shoji, no kimono. "
             f"empty ancient Chinese landscape, no people, no humans, no characters, "
-            f"no portraits, no figures. {scene.name}. {(scene.prompt_en or scene.description)}. "
+            f"no portraits, no figures. {scene.prompt_en or 'ancient Chinese xianxia environment'}. "
             f"{scene_style}, no modern elements, cinematic lighting, detailed environment, best quality."
         )
         negative_prompt = ", ".join(
@@ -1354,6 +1466,53 @@ class AssetGenerator:
         prompt, _qa_neg = lint_prompt(prompt, "scene")
         if _qa_neg:
             negative_prompt = (negative_prompt + ", " + _qa_neg).strip(", ")
+
+        try:
+            from ...models.local import local_enabled
+
+            local_image = local_enabled("image")
+        except Exception:
+            local_image = False
+        if local_image:
+            desc = (scene.prompt_en or "")[:180]
+            blob = f"{scene.name} {scene.description or ''} {desc}"
+            if any(k in blob for k in ("镇", "城", "街", "村", "集市", "坊市")):
+                scale = (
+                    "wide establishing shot of the whole town, long market street, "
+                    "rows of ancient Chinese shops and houses, many buildings, "
+                    "aerial view, not a single building close-up"
+                )
+                scale_negative = (
+                    "single building close-up, facade only, interior view, room"
+                )
+            elif any(
+                k in blob for k in ("客栈", "酒楼", "屋", "店", "楼", "阁", "殿", "宫")
+            ):
+                scale = (
+                    "exterior establishing shot of the full building, complete facade, "
+                    "surrounding street and environment"
+                )
+                scale_negative = "interior view, single room, close-up facade only"
+            elif any(k in blob for k in ("洞", "穴", "谷", "林", "山", "湖", "河")):
+                scale = (
+                    "wide natural environment establishing shot, full terrain visible"
+                )
+                scale_negative = "single building, room interior"
+            else:
+                scale = "wide establishing shot, full environment visible"
+                scale_negative = ""
+            prompt = (
+                f"Cinematic 3D donghua environment, "
+                f"{desc or 'ancient Chinese xianxia environment'}, {scale}, "
+                f"{(positive_prompt or '')[:120]}, "
+                "empty ancient Chinese xianxia landscape, no people, no characters, "
+                "ancient Chinese architecture, detailed, cinematic lighting"
+            )
+            negative_prompt = (
+                f"{negative_prompt}, people, person, human, crowd, portrait, "
+                "character, figure, modern road, cars, power lines, text, watermark, "
+                f"2D, illustration, anime, {scale_negative}"
+            )
 
         try:
             for _ in range(batch_size):
@@ -1465,7 +1624,7 @@ class AssetGenerator:
 
         prompt = (
             f"{positive_prompt}, ancient Chinese historical setting, no modern elements, "
-            f"Prop Design: {prop.name}. {(prop.prompt_en or prop.description)}. Isolated on white background, "
+            f"Prop Design: {(prop.prompt_en or 'ancient Chinese prop')}. Isolated on white background, "
             "high quality, detailed."
         )
         negative_prompt = ", ".join(
@@ -1476,6 +1635,70 @@ class AssetGenerator:
             )
             if p
         )
+
+        # Local SDXL: prop name/description must come first (long style prompts
+        # get truncated). Also keep the object isolated — no scene, no people.
+        try:
+            from ...models.local import local_enabled
+
+            local_image = local_enabled("image")
+        except Exception:
+            local_image = False
+        if local_image:
+            desc = (prop.prompt_en or "")[:180]
+            blob = f"{prop.name} {prop.description or ''} {desc}"
+            name = prop.name or ""
+            if any(k in name for k in ("马车", "车", "轿", "船", "舟", "辇")):
+                type_anchor = (
+                    "one complete ancient Chinese horse carriage, black lacquered "
+                    "wooden body, wooden wheels, canopy, horse, small triangular "
+                    "black flag mounted on the carriage frame, full vehicle visible"
+                )
+                type_negative = (
+                    "flag only, banner only, no carriage, missing wheels, "
+                    "modern car, truck, bicycle"
+                )
+                main_desc = type_anchor
+            elif any(k in name for k in ("旗", "幡", "帜")):
+                type_anchor = (
+                    "one small pure black triangular cloth flag, black fabric only, "
+                    "no red areas, plain black pennant with soft folds, attached to a "
+                    "short thin wooden stick, hanging down naturally, no stand, no base"
+                )
+                type_negative = (
+                    "red, red flag, red cloth, red banner, stand, base, pedestal, "
+                    "tassel, ornament, large pole, rectangular banner, landscape, "
+                    "text, arrowhead, spear tip, blade, weapon, shield, second flag"
+                )
+                main_desc = type_anchor
+            elif any(k in name for k in ("烟杆", "烟斗", "烟袋", "烟枪")):
+                type_anchor = (
+                    "a long traditional Chinese tobacco pipe, very long thin dark "
+                    "bamboo or wood stem, small brass bowl at one end, jade mouthpiece, "
+                    "antique Asian smoking pipe, not a western briar pipe, exactly one pipe"
+                )
+                type_negative = (
+                    "western pipe, briar pipe, corn cob pipe, cigar, cigarette, "
+                    "modern smoking pipe, short fat pipe, bent pipe, multiple pipes, "
+                    "collection of pipes, set, assortment, grid of objects, many items, "
+                    "bell, urn, gourd, display shelf"
+                )
+                main_desc = type_anchor
+            else:
+                type_anchor = ""
+                type_negative = ""
+                main_desc = desc or "ancient Chinese prop"
+            prompt = (
+                "Chinese 3D donghua prop design, single isolated object, "
+                f"{main_desc}, ancient Chinese, {(positive_prompt or '')[:140]}, "
+                "centered, full object in frame, white background, detailed, no people"
+            )
+            negative_prompt = (
+                "modern object, plastic, electric, 21st century, urban, "
+                "multiple objects, duplicate, people, person, hands, character, "
+                f"text, watermark, 2D, illustration, anime, blurry, low quality, "
+                f"{type_negative}"
+            )
 
         try:
             for _ in range(batch_size):

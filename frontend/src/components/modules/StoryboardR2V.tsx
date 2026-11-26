@@ -412,9 +412,6 @@ export default function StoryboardR2V() {
     // setShots() when the new frames come back.
     const [genDialogOpen, setGenDialogOpen] = useState(false);
     const [generating, setGenerating] = useState(false);
-    // Guard so entering the storyboard step with an empty project kicks off
-    // the LLM breakdown once per project per session (not on every re-render).
-    const autoStoryboardRef = useRef<Set<string>>(new Set());
     const [bannerState, setBannerState] = useState<BannerState>(
         () => (currentProject?.frames?.length ?? 0) > 0 ? "summary" : "idle"
     );
@@ -541,27 +538,6 @@ export default function StoryboardR2V() {
             });
         }
     }, [currentProject, updateProject, t]);
-
-    // Auto-breakdown: when the user enters the storyboard step on a project
-    // that has script text but no frames yet, run the LLM breakdown once
-    // instead of making them click 「生成分镜」.
-    useEffect(() => {
-        if (!currentProject?.id || generating) return;
-        if ((currentProject.frames?.length ?? 0) > 0) return;
-        if (autoStoryboardRef.current.has(currentProject.id)) return;
-        const text =
-            (currentProject as any).originalText ||
-            (currentProject as any).original_text ||
-            "";
-        if (!text.trim()) return;
-        autoStoryboardRef.current.add(currentProject.id);
-        void handleSmartGenerate();
-    }, [
-        currentProject?.id,
-        currentProject?.frames?.length,
-        generating,
-        handleSmartGenerate,
-    ]);
 
     const handleRefineFrame = useCallback(async (frameId: string) => {
         if (!currentProject?.id) return;

@@ -2,6 +2,15 @@
 
 This file provides guidance to AI coding agents (Codex CLI / Qoder) when working with code in this repository. It mirrors the project's `CLAUDE.md` so that Claude Code, Codex, and Qoder share identical project rules. When this file and `CLAUDE.md` diverge, treat `CLAUDE.md` as the source of truth and re-sync here.
 
+## Tool Edit Discipline (Memory Rule — Always Apply)
+
+- **禁止一次性大段编辑/重写整个函数或文件。** 单次 `edit` 只改一个函数内的一小块（建议 ≤ 40 行），并带唯一上下文。
+- 大改动拆成小步：先加 helper/字段 → 再逐个改调用点 → 每步后用 `grep` / `pytest` / `npm run typecheck` 验证。
+- 连续 2 次工具调用失败或被中断时，立即停止重试相同的大编辑，改用更小的目标或先说明。
+- 成功经验：新增方法 → 只改一个调用点 → 跑对应测试 → 确认后再改下一个调用点。
+- 若一次性替换超过约 40 行，必须拆成多次编辑；不要用整段 `oldString` 覆盖整个方法。
+- 成功经验（资产分层）：全局库只作为素材来源；分集读取只合并正文提及/分镜引用的全局资产；提取命中全局资产时把媒体复制进本集（auto-import），避免全局资产出现在所有分集。
+
 ## Git Commit Rules
 
 - Git author is already configured for this repo, do not modify git config

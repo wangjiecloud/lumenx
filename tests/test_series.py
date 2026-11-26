@@ -330,10 +330,12 @@ class TestMergeSharedAssets:
 
         pipeline.reparse_project(episode.id, "text")
 
-        assert pipeline.scripts[episode.id].characters == []
-        resolved = pipeline.resolve_episode_assets(pipeline.scripts[episode.id])
-        merged = next(c for c in resolved["characters"] if c.name == "南宫婉")
-        assert merged.reference_sheet.image_variants[0].url == "uploads/nangong.png"
+        # Global match is auto-imported into the episode (not dropped), so it
+        # becomes editable/generatable here instead of every global asset being
+        # appended to every episode.
+        chars = pipeline.scripts[episode.id].characters
+        assert len(chars) == 1
+        assert chars[0].reference_sheet.image_variants[0].url == "uploads/nangong.png"
 
 
 class TestStyleReferenceSelection:

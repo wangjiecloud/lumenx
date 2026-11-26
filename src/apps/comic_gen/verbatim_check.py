@@ -5,6 +5,7 @@ compares the source screenplay against the union of frame text fields and
 returns the blocks that are not represented, so the pipeline can ask the LLM to
 generate additional frames for them (no compression allowed).
 """
+
 import re
 from typing import Any, Dict, List
 
@@ -49,7 +50,7 @@ def _frame_corpus(frames: List[Dict[str, Any]]) -> str:
     return _normalize("".join(parts))
 
 
-def _is_covered(block: str, corpus: str) -> bool:
+def _is_covered(block: str, corpus: str, corpus_ngrams=None) -> bool:
     key = _normalize(block)
     if not key:
         return True
@@ -59,12 +60,28 @@ def _is_covered(block: str, corpus: str) -> bool:
     for prefix_len in (16, 12, 8):
         if len(key) >= prefix_len and key[:prefix_len] in corpus:
             return True
+    # Paraphrases may not share a long prefix but still share most 4-grams.
+    if corpus_ngrams is not None and len(key) >= 8:
+        key_ngrams = {key[i : i + 4] for i in range(max(0, len(key) - 3))}
+        if key_ngrams:
+            overlap = len(key_ngrams & corpus_ngrams) / len(key_ngrams)
+            if overlap >= 0.35:
+                return True
     return False
+
+
+def _ngram_set(text: str, n: int = 4) -> set:
+    return {text[i : i + n] for i in range(max(0, len(text) - n + 1))}
 
 
 def missing_blocks(text: str, frames: List[Dict[str, Any]]) -> List[str]:
     corpus = _frame_corpus(frames)
-    return [block for block in extract_blocks(text) if not _is_covered(block, corpus)]
+    corpus_ngrams = _ngram_set(corpus)
+    return [
+        block
+        for block in extract_blocks(text)
+        if not _is_covered(block, corpus, corpus_ngrams)
+    ]
 
 
 def coverage_ratio(text: str, frames: List[Dict[str, Any]]) -> float:
@@ -72,5 +89,6 @@ def coverage_ratio(text: str, frames: List[Dict[str, Any]]) -> float:
     if not blocks:
         return 1.0
     corpus = _frame_corpus(frames)
-    covered = sum(1 for block in blocks if _is_covered(block, corpus))
+    corpus_ngrams = _ngram_set(corpus)
+    covered = sum(1 for block in blocks if _is_covered(block, corpus, corpus_ngrams))
     return covered / len(blocks)

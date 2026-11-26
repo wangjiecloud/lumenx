@@ -423,6 +423,18 @@ export default function AssetInspector({
           </div>
         )}
 
+        {/* Chinese description — display only */}
+        {(asset as any).description && (
+          <div>
+            <div className="font-mono text-[0.5625rem] font-semibold uppercase tracking-[0.16em] text-text-secondary mb-2.5">
+              {t("chineseSection")}
+            </div>
+            <div className="bg-surface-inset rounded-lg p-3.5 text-[0.8125rem] leading-relaxed text-text-secondary">
+              {(asset as any).description}
+            </div>
+          </div>
+        )}
+
         {/* Actions */}
         {/*
           生成更多变体：project 资产复用「按项目 batch 生成」管线，对当前 asset append 新变体

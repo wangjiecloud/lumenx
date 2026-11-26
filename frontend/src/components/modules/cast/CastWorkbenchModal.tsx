@@ -132,7 +132,7 @@ const CHARACTER_TEMPLATES: Record<CharacterTemplate, {
 
 function buildTemplate(kind: CastKind, entity: any, template?: CharacterTemplate): string {
     const name = entity?.name || "";
-    const desc = entity?.description || "";
+    const desc = entity?.prompt_en || entity?.description || "";
     const charDesc = `${name}${desc ? "，" + desc : ""}`;
 
     if (kind === "character") {
@@ -142,7 +142,7 @@ function buildTemplate(kind: CastKind, entity: any, template?: CharacterTemplate
     if (kind === "scene") {
         return `${name}${desc ? "：" + desc : ""}\n\nComposition: wide establishing shot of the environment on neutral gray background, single unified image, no figures in foreground. Emphasize atmosphere, architecture and terrain structure. Lighting and color palette match the scene mood. Soft volumetric lighting, depth of field.`;
     }
-    return `${name}${desc ? "：" + desc : ""}\n\nComposition: product photography style on neutral gray background, single unified image, seamless layout without borders. Main view: object centered at slight angle. Secondary views: detail close-ups of material and texture. Clean even studio lighting, subtle shadow beneath object.`;
+    return `${name}${desc ? "：" + desc : ""}\n\nComposition: product photography on neutral gray background, exactly one object only, single item centered, full object visible, no secondary views, no multiple objects, no collection or set, clean even studio lighting, subtle shadow beneath the object.`;
 }
 
 function getTemplateNegative(kind: CastKind, template?: CharacterTemplate): string {
@@ -421,13 +421,27 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
 
     const handleSelectVariant = async (variantId: string) => {
         try {
-            const updated = await api.selectAssetVariant(
-                currentProject.id,
-                entity.id,
-                kind,
-                variantId,
-            );
-            updateProject(currentProject.id, updated);
+            const source = (entity as any).source;
+            if (source === "series" && currentProject.series_id) {
+                await api.seriesSelectAssetVariant(
+                    currentProject.series_id,
+                    entity.id,
+                    kind,
+                    variantId,
+                );
+            } else {
+                await api.selectAssetVariant(
+                    currentProject.id,
+                    entity.id,
+                    kind,
+                    variantId,
+                );
+            }
+            // Re-fetch the full merged project. The raw mutation response only
+            // contains episode-local assets and would wipe series/global ones
+            // from the store (making the list look empty after closing).
+            const fresh = await api.getProject(currentProject.id);
+            updateProject(currentProject.id, fresh);
             toast.success(t("toastSelected"), {
                 projectId: currentProject.id,
                 projectTitle: currentProject.title,
@@ -471,10 +485,11 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                 const fresh = await api.getProject(currentProject.id);
                 updateProject(currentProject.id, fresh);
             } else {
-                const updated = await api.deleteAssetVariant(
+                await api.deleteAssetVariant(
                     currentProject.id, entity.id, kind, variantId,
                 );
-                updateProject(currentProject.id, updated);
+                const fresh = await api.getProject(currentProject.id);
+                updateProject(currentProject.id, fresh);
             }
             toast.success(t("toastDeleted"));
         } catch (err: any) {
@@ -799,6 +814,15 @@ export default function CastWorkbenchModal({ isOpen, kind, entityId, onClose }: 
                                                         <span className="text-text-secondary">{effectivePrompt.negative}</span>
                                                     </p>
                                                     <p className="text-[0.625rem] text-text-muted">size: {effectivePrompt.size}</p>
+                                                    <div className="mt-2 border-t border-glass-border pt-2">
+                                                        <p className="text-[0.625rem] text-text-muted">{t("chineseExplanation")}</p>
+                                                        <p className="text-[0.75rem] leading-relaxed text-text-secondary">
+                                                            {entity.description}
+                                                            {entity.clothing ? `；服装：${entity.clothing}` : ""}
+                                                            {kind === "character" && entity.age ? `；年龄：${entity.age}` : ""}
+                                                            {kind === "character" && entity.disposition ? `；气质：${entity.disposition}` : ""}
+                                                        </p>
+                                                    </div>
                                                 </div>
                                             ) : (
                                                 <p className="text-[0.75rem] leading-relaxed">

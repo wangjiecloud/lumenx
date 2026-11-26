@@ -801,6 +801,65 @@ class ComicGenPipeline:
             return True
         return bool(getattr(entity, "image_url", None))
 
+    def library_asset_is_relevant(self, script, asset, asset_type: str) -> bool:
+        """A global-library asset belongs in this episode only when the episode
+        actually mentions it (name/alias in the script) or a frame references
+        its id. Prevents every global asset from appearing in every episode."""
+        if script is None or asset is None:
+            return False
+        ref_ids = set()
+        for frame in getattr(script, "frames", []) or []:
+            if getattr(frame, "scene_id", None):
+                ref_ids.add(frame.scene_id)
+            ref_ids.update(getattr(frame, "character_ids", []) or [])
+            ref_ids.update(getattr(frame, "prop_ids", []) or [])
+        if getattr(asset, "id", None) in ref_ids:
+            return True
+
+        parts = [
+            getattr(script, "title", "") or "",
+            getattr(script, "original_text", "") or "",
+        ]
+        for frame in getattr(script, "frames", []) or []:
+            for attr in (
+                "action_description",
+                "visual_description",
+                "dialogue",
+                "action_summary",
+            ):
+                value = getattr(frame, attr, None)
+                if value:
+                    parts.append(str(value))
+        for attr in ("characters", "scenes", "props"):
+            for entity in getattr(script, attr, []) or []:
+                parts.append(getattr(entity, "name", "") or "")
+                parts.extend(getattr(entity, "aliases", []) or [])
+        blob = " ".join(parts).casefold()
+        keys = {str(getattr(asset, "name", "") or "").strip().casefold()}
+        keys.update(
+            str(a).strip().casefold() for a in (getattr(asset, "aliases", []) or [])
+        )
+        return any(k and k in blob for k in keys)
+
+    def _copy_shared_media(self, entity, match, fields) -> None:
+        """Copy media/metadata from a global match into the episode entity."""
+        from copy import deepcopy
+
+        for field in fields:
+            if hasattr(match, field) and hasattr(entity, field):
+                try:
+                    setattr(entity, field, deepcopy(getattr(match, field)))
+                except Exception:
+                    logger.warning("Failed to copy shared field %s", field)
+        if not getattr(entity, "aliases", None):
+            entity.aliases = list(getattr(match, "aliases", []) or [])
+        for extra in ("voice_id", "voice_name", "clothing", "prompt_en", "disposition"):
+            if not getattr(entity, extra, None) and getattr(match, extra, None):
+                try:
+                    setattr(entity, extra, deepcopy(getattr(match, extra)))
+                except Exception:
+                    pass
+
     def _merge_entity_pools(self, local: List[Any], *shared_pools) -> List[Any]:
         """Layer asset pools by id AND name/alias, so a shared asset whose id
         differs from an episode-local copy (same name) never renders twice."""
@@ -848,6 +907,18 @@ class ComicGenPipeline:
             ),
         )
         drop_map: Dict[str, str] = {}
+        series_id_sets = {
+            "characters": {
+                c.id for c in (getattr(series, "characters", []) if series else [])
+            },
+            "scenes": {s.id for s in (getattr(series, "scenes", []) if series else [])},
+            "props": {p.id for p in (getattr(series, "props", []) if series else [])},
+        }
+        field_map = {
+            "characters": self._CHAR_ASSET_FIELDS,
+            "scenes": self._SCENE_ASSET_FIELDS,
+            "props": self._PROP_ASSET_FIELDS,
+        }
         for pool_attr, shared_pool in groups:
             new_pool = list(getattr(script, pool_attr, []) or [])
             kept = []
@@ -863,8 +934,17 @@ class ComicGenPipeline:
                     None,
                 )
                 if match is not None and not self._entity_has_media(entity, pool_attr):
-                    drop_map[entity.id] = match.id
-                    continue
+                    if match.id in series_id_sets[pool_attr]:
+                        drop_map[entity.id] = match.id
+                        continue
+                    # Global match: auto-import its media into this episode so
+                    # the asset is local/editable/generatable here.
+                    self._copy_shared_media(entity, match, field_map[pool_attr])
+                    logger.info(
+                        "Auto-imported global %s '%s' into episode",
+                        pool_attr,
+                        getattr(entity, "name", ""),
+                    )
                 kept.append(entity)
             setattr(script, pool_attr, kept)
         if drop_map:
@@ -1503,6 +1583,19 @@ class ComicGenPipeline:
         style_refs = self.collect_style_reference_paths(
             style_pools, asset_type, exclude_id=target_asset.id, target=target_asset
         )
+        # IP-Adapter copies composition from the reference. For local R2V
+        # reference sheets we need a full-body frame, so don't let a bust
+        # reference override the framing; style comes from the 3D prompt.
+        try:
+            from ...models.local import local_enabled
+
+            if local_enabled("image") and (
+                asset_type in ("scene", "prop")
+                or (asset_type == "character" and generation_type == "reference_sheet")
+            ):
+                style_refs = []
+        except Exception:
+            pass
         if style_refs:
             style_hint = (
                 "consistent art style with the provided reference images, "
@@ -1787,6 +1880,16 @@ class ComicGenPipeline:
         style_refs = self.collect_style_reference_paths(
             style_pools, asset_type, exclude_id=asset_id, target=style_target
         )
+        try:
+            from ...models.local import local_enabled
+
+            if local_enabled("image") and (
+                asset_type in ("scene", "prop")
+                or (asset_type == "character" and generation_type == "reference_sheet")
+            ):
+                style_refs = []
+        except Exception:
+            pass
         if style_refs:
             positive_prompt = (
                 f"{positive_prompt}, consistent art style with the provided reference images, "
@@ -2505,13 +2608,16 @@ class ComicGenPipeline:
         # Verbatim coverage: no source line may be dropped. Backfill missing blocks
         # by running the same extractor on just the missing lines.
         try:
-            from .verbatim_check import missing_blocks
+            from .verbatim_check import extract_blocks, missing_blocks
 
+            blocks = extract_blocks(analysis_text)
             missing = missing_blocks(analysis_text, raw_frames)
-            if missing:
+            missing_ratio = len(missing) / max(1, len(blocks))
+            if missing and missing_ratio <= 0.5:
                 logger.warning(
-                    "Verbatim coverage: %d source blocks missing; backfilling",
+                    "Verbatim coverage: %d source blocks missing (%.0f%%); backfilling",
                     len(missing),
+                    missing_ratio * 100,
                 )
                 extra = self.script_processor.analyze_to_storyboard(
                     "\n".join(missing),
@@ -2521,8 +2627,40 @@ class ComicGenPipeline:
                     previous_context=previous_context,
                 )
                 if extra:
-                    raw_frames.extend(extra)
-                    logger.info("Verbatim backfill added %d frames", len(extra))
+
+                    def _frame_key(frame: Dict[str, Any]) -> str:
+                        return "".join(
+                            str(
+                                (frame.get("action_summary") or "")
+                                + (frame.get("dialogue") or "")
+                                + (frame.get("action_description") or "")
+                            ).split()
+                        )
+
+                    seen = {_frame_key(f) for f in raw_frames}
+                    max_extra = min(len(missing), max(10, len(raw_frames) // 2))
+                    unique_extra = []
+                    for frame in extra:
+                        key = _frame_key(frame)
+                        if key and key in seen:
+                            continue
+                        seen.add(key)
+                        unique_extra.append(frame)
+                        if len(unique_extra) >= max_extra:
+                            break
+                    raw_frames.extend(unique_extra)
+                    logger.info(
+                        "Verbatim backfill added %d unique frames (of %d returned)",
+                        len(unique_extra),
+                        len(extra),
+                    )
+            elif missing:
+                logger.warning(
+                    "Coverage detector reports %.0f%% blocks missing — likely a "
+                    "matching false-positive; skipping backfill to avoid duplicate "
+                    "frames and runaway LLM calls.",
+                    missing_ratio * 100,
+                )
         except Exception as exc:
             logger.warning("verbatim coverage check failed: %s", exc)
 
@@ -6729,31 +6867,41 @@ class ComicGenPipeline:
             # Auto-lookup series if episode has series_id
             if episode.series_id:
                 series = self.series_store.get(episode.series_id)
+        relevant_lib_chars = [
+            c
+            for c in self.library_store.characters
+            if self.library_asset_is_relevant(episode, c, "character")
+        ]
+        relevant_lib_scenes = [
+            s
+            for s in self.library_store.scenes
+            if self.library_asset_is_relevant(episode, s, "scene")
+        ]
+        relevant_lib_props = [
+            p
+            for p in self.library_store.props
+            if self.library_asset_is_relevant(episode, p, "prop")
+        ]
         if not series:
             # No parent series — episode-local assets sit on top of the
-            # global library (lowest layer). With an empty library this
-            # yields the episode's own assets (back-compat).
+            # relevant global assets only.
             return {
                 "characters": self._merge_entity_pools(
-                    episode.characters, self.library_store.characters
+                    episode.characters, relevant_lib_chars
                 ),
-                "scenes": self._merge_entity_pools(
-                    episode.scenes, self.library_store.scenes
-                ),
-                "props": self._merge_entity_pools(
-                    episode.props, self.library_store.props
-                ),
+                "scenes": self._merge_entity_pools(episode.scenes, relevant_lib_scenes),
+                "props": self._merge_entity_pools(episode.props, relevant_lib_props),
             }
         # Merge by id AND name/alias so a shared asset never appears twice
         # next to an episode-local copy with the same name but a different id.
         merged_characters = self._merge_entity_pools(
-            episode.characters, series.characters, self.library_store.characters
+            episode.characters, series.characters, relevant_lib_chars
         )
         merged_scenes = self._merge_entity_pools(
-            episode.scenes, series.scenes, self.library_store.scenes
+            episode.scenes, series.scenes, relevant_lib_scenes
         )
         merged_props = self._merge_entity_pools(
-            episode.props, series.props, self.library_store.props
+            episode.props, series.props, relevant_lib_props
         )
 
         return {

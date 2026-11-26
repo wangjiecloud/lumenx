@@ -1649,9 +1649,26 @@ def get_project(script_id: str):
     # this is a no-op and the response is byte-identical to before.
     lib = pipeline.library_store
     if lib.characters or lib.scenes or lib.props:
-        _append_layer(payload["characters"], lib.characters, "global")
-        _append_layer(payload["scenes"], lib.scenes, "global")
-        _append_layer(payload["props"], lib.props, "global")
+        # Only surface global assets that this episode actually mentions or
+        # references — not the whole library in every episode.
+        lib_chars = [
+            c
+            for c in lib.characters
+            if pipeline.library_asset_is_relevant(script, c, "character")
+        ]
+        lib_scenes = [
+            s
+            for s in lib.scenes
+            if pipeline.library_asset_is_relevant(script, s, "scene")
+        ]
+        lib_props = [
+            p
+            for p in lib.props
+            if pipeline.library_asset_is_relevant(script, p, "prop")
+        ]
+        _append_layer(payload["characters"], lib_chars, "global")
+        _append_layer(payload["scenes"], lib_scenes, "global")
+        _append_layer(payload["props"], lib_props, "global")
     return signed_response(payload)
 
 
